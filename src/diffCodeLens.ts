@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { StateManager } from './stateManager';
-import { computeHunks, hunkId } from './diffEngine';
+import { canComputeHunks, computeHunks, hunkId } from './diffEngine';
 
 export class DiffCodeLensProvider implements vscode.CodeLensProvider {
   private _onDidChangeCodeLenses = new vscode.EventEmitter<void>();
@@ -29,6 +29,7 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
 
     const fileState = this.stateManager.getFile(document.uri.fsPath);
     if (!fileState || fileState.status !== 'reviewing') return [];
+    if (fileState.diffUnavailable || !canComputeHunks(fileState.baseline, document.getText())) return [];
 
     const hunks = computeHunks(fileState.baseline, document.getText());
     const lenses: vscode.CodeLens[] = [];

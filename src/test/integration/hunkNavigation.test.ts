@@ -78,7 +78,28 @@ suite('hunkwise hunk navigation integration', function () {
     return filePath;
   }
 
-  test('acceptHunk on first hunk jumps cursor to second hunk', async () => {
+  test('next/previous hunk commands navigate between pending changes', async () => {
+    const filePath = await setupMultiHunkFile();
+    const sm = getStateManager();
+    const fileState = sm.getFile(filePath);
+    assert.ok(fileState, 'File should be in state');
+
+    const doc = await vscode.workspace.openTextDocument(filePath);
+    const editor = await vscode.window.showTextDocument(doc);
+    const hunks = computeHunks(fileState.baseline, doc.getText());
+    assert.ok(hunks.length >= 2, `Expected at least 2 hunks, got ${hunks.length}`);
+
+    const first = new vscode.Position(hunks[0].newStart - 1, 0);
+    editor.selection = new vscode.Selection(first, first);
+
+    await vscode.commands.executeCommand('hunkwise.nextHunk');
+    assert.strictEqual(editor.selection.active.line, hunks[1].newStart - 1, 'Next should move to second hunk');
+
+    await vscode.commands.executeCommand('hunkwise.previousHunk');
+    assert.strictEqual(editor.selection.active.line, hunks[0].newStart - 1, 'Previous should move back to first hunk');
+  });
+
+  test('acceptHunk on first hunk keeps cursor in place', async () => {
     const filePath = await setupMultiHunkFile();
     const sm = getStateManager();
     const fileState = sm.getFile(filePath);
@@ -92,6 +113,9 @@ suite('hunkwise hunk navigation integration', function () {
     assert.ok(hunks.length >= 2, `Expected at least 2 hunks, got ${hunks.length}`);
 
     const firstHunkId = hunkId(hunks[0]);
+    const originalLine = hunks[0].newStart - 1;
+    const pos = new vscode.Position(originalLine, 0);
+    editor.selection = new vscode.Selection(pos, pos);
 
     // Accept the first hunk
     acceptHunk(sm, filePath, firstHunkId, () => {});
@@ -102,16 +126,15 @@ suite('hunkwise hunk navigation integration', function () {
     assert.ok(updatedState, 'File should still be tracked');
     assert.strictEqual(updatedState?.status, 'reviewing', 'File should still be in reviewing state');
 
-    // Recompute hunks and verify cursor is at the start of the next remaining hunk
+    // Recompute hunks and verify cursor did not auto-jump to the next hunk.
     const remainingHunks = computeHunks(updatedState!.baseline, doc.getText());
     assert.ok(remainingHunks.length >= 1, `Expected remaining hunks, got ${remainingHunks.length}`);
-    const expectedLine = remainingHunks[0].newStart - 1;
     const cursorLine = editor.selection.active.line;
-    assert.strictEqual(cursorLine, expectedLine,
-      `Cursor should be at line ${expectedLine} (next hunk), but is at line ${cursorLine}`);
+    assert.strictEqual(cursorLine, originalLine,
+      `Cursor should stay at line ${originalLine}, but is at line ${cursorLine}`);
   });
 
-  test('discardHunk on first hunk jumps cursor to second hunk', async () => {
+  test('discardHunk on first hunk keeps cursor in place', async () => {
     const filePath = await setupMultiHunkFile();
     const sm = getStateManager();
     const fw = getFileWatcher();
@@ -127,6 +150,9 @@ suite('hunkwise hunk navigation integration', function () {
     assert.ok(hunks.length >= 2, `Expected at least 2 hunks, got ${hunks.length}`);
 
     const firstHunkId = hunkId(hunks[0]);
+    const originalLine = hunks[0].newStart - 1;
+    const pos = new vscode.Position(originalLine, 0);
+    editor.selection = new vscode.Selection(pos, pos);
 
     // Discard the first hunk
     await discardHunk(sm, fw, filePath, firstHunkId, () => {});
@@ -137,14 +163,13 @@ suite('hunkwise hunk navigation integration', function () {
     assert.ok(updatedState, 'File should still be tracked');
     assert.strictEqual(updatedState?.status, 'reviewing', 'File should still be in reviewing state');
 
-    // Recompute hunks and verify cursor is at the start of the next remaining hunk
+    // Recompute hunks and verify cursor did not auto-jump to the next hunk.
     const updatedDoc = editor.document;
     const remainingHunks = computeHunks(updatedState!.baseline, updatedDoc.getText());
     assert.ok(remainingHunks.length >= 1, `Expected remaining hunks, got ${remainingHunks.length}`);
-    const expectedLine = remainingHunks[0].newStart - 1;
     const cursorLine = editor.selection.active.line;
-    assert.strictEqual(cursorLine, expectedLine,
-      `Cursor should be at line ${expectedLine} (next hunk), but is at line ${cursorLine}`);
+    assert.strictEqual(cursorLine, originalLine,
+      `Cursor should stay at line ${originalLine}, but is at line ${cursorLine}`);
   });
 
   test('acceptHunk on last hunk does not jump (exits reviewing)', async () => {
@@ -184,6 +209,71 @@ suite('hunkwise hunk navigation integration', function () {
     const updatedState = sm.getFile(filePath);
     assert.ok(!updatedState || updatedState.status !== 'reviewing',
       'File should exit reviewing after accepting last hunk');
+  });
+
+  test('undoReviewAction restores state after accepting a hunk', async () => {
+    const root = getWorkspaceRoot();
+    const filePath = path.join(root, 'undo-accept.txt');
+    const baseline = 'original line\n';
+    const modified = 'modified line\n';
+
+    writeFileExternally(filePath, baseline);
+    await enableHunkwise();
+
+    const rel = path.relative(root, filePath);
+    await waitForCondition(() => gitGetBaseline(root, rel) === baseline, 5000);
+
+    writeFileExternally(filePath, modified);
+
+    const sm = getStateManager();
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 5000);
+
+    const doc = await vscode.workspace.openTextDocument(filePath);
+    await vscode.window.showTextDocument(doc);
+
+    const fileState = sm.getFile(filePath)!;
+    const hunks = computeHunks(fileState.baseline, doc.getText());
+    assert.strictEqual(hunks.length, 1, 'Should have exactly 1 hunk');
+
+    acceptHunk(sm, filePath, hunkId(hunks[0]), () => {});
+    await waitForCondition(() => !sm.getFile(filePath), 5000);
+
+    await vscode.commands.executeCommand('hunkwise.undoReviewAction');
+
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 5000);
+    assert.strictEqual(sm.getFile(filePath)?.baseline, baseline, 'Undo should restore the pre-accept baseline');
+    await waitForCondition(() => gitGetBaseline(root, rel) === baseline, 5000);
+
+    const restoredHunks = computeHunks(sm.getFile(filePath)!.baseline, doc.getText());
+    assert.strictEqual(restoredHunks.length, 1, 'Accepted hunk should be selectable again after undo');
+  });
+
+  test('undoReviewAction can step back through multiple accepted hunks', async () => {
+    const filePath = await setupMultiHunkFile();
+    const sm = getStateManager();
+    const doc = await vscode.workspace.openTextDocument(filePath);
+    await vscode.window.showTextDocument(doc);
+
+    const initialState = sm.getFile(filePath)!;
+    const initialBaseline = initialState.baseline;
+    const initialHunks = computeHunks(initialBaseline, doc.getText());
+    assert.ok(initialHunks.length >= 3, `Expected at least 3 hunks, got ${initialHunks.length}`);
+
+    acceptHunk(sm, filePath, hunkId(initialHunks[0]), () => {});
+    const afterFirst = sm.getFile(filePath)!;
+    const afterFirstBaseline = afterFirst.baseline;
+    assert.notStrictEqual(afterFirstBaseline, initialBaseline, 'First accept should update baseline');
+
+    const hunksAfterFirst = computeHunks(afterFirstBaseline, doc.getText());
+    acceptHunk(sm, filePath, hunkId(hunksAfterFirst[0]), () => {});
+    const afterSecond = sm.getFile(filePath)!;
+    assert.notStrictEqual(afterSecond.baseline, afterFirstBaseline, 'Second accept should update baseline again');
+
+    await vscode.commands.executeCommand('hunkwise.undoReviewAction');
+    await waitForCondition(() => sm.getFile(filePath)?.baseline === afterFirstBaseline, 5000);
+
+    await vscode.commands.executeCommand('hunkwise.undoReviewAction');
+    await waitForCondition(() => sm.getFile(filePath)?.baseline === initialBaseline, 5000);
   });
 
   test('discardHunk on last hunk does not jump (exits reviewing)', async () => {
@@ -227,7 +317,7 @@ suite('hunkwise hunk navigation integration', function () {
       'File should exit reviewing after discarding last hunk');
   });
 
-  test('acceptHunk on middle hunk jumps to next hunk (not first)', async () => {
+  test('acceptHunk on middle hunk keeps cursor in place', async () => {
     const filePath = await setupMultiHunkFile();
     const sm = getStateManager();
     const fileState = sm.getFile(filePath);
@@ -240,23 +330,23 @@ suite('hunkwise hunk navigation integration', function () {
     assert.ok(hunks.length >= 3, `Expected at least 3 hunks, got ${hunks.length}`);
 
     const middleHunkId = hunkId(hunks[1]);
+    const originalLine = hunks[1].newStart - 1;
+    const pos = new vscode.Position(originalLine, 0);
+    editor.selection = new vscode.Selection(pos, pos);
 
     // Accept the middle hunk
     acceptHunk(sm, filePath, middleHunkId, () => {});
     await sleep(200);
 
-    // Recompute hunks and verify cursor landed on the next remaining hunk
-    // (should be the former third hunk, not the first)
+    // Recompute hunks and verify cursor did not auto-jump.
     const updatedState = sm.getFile(filePath);
     assert.ok(updatedState, 'File should still be tracked');
     const remainingHunks = computeHunks(updatedState!.baseline, doc.getText());
     assert.ok(remainingHunks.length >= 2,
       `Expected at least 2 remaining hunks, got ${remainingHunks.length}`);
 
-    // The second remaining hunk is the former third hunk — cursor should be there
-    const expectedLine = remainingHunks[1].newStart - 1;
     const cursorLine = editor.selection.active.line;
-    assert.strictEqual(cursorLine, expectedLine,
-      `Cursor should be at line ${expectedLine} (next hunk after middle), but is at line ${cursorLine}`);
+    assert.strictEqual(cursorLine, originalLine,
+      `Cursor should stay at line ${originalLine}, but is at line ${cursorLine}`);
   });
 });

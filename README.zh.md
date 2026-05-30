@@ -30,7 +30,7 @@ hunkwise 使用了 [VSCode 提案 API](https://code.visualstudio.com/api/advance
 
 直接告诉你的 AI 工具：
 
-> Run this skill: <https://github.com/molon/hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
+> Run this skill: <https://github.com/Rhys-Wang-wannaLearnMath/hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
 
 ## 使用方法
 
@@ -78,6 +78,7 @@ hunkwise 使用了 [VSCode 提案 API](https://code.visualstudio.com/api/advance
 | `ignorePatterns` | `[".git"]` | 不追踪的 glob 模式列表 |
 | `respectGitignore` | `true` | 是否遵守 `.gitignore` 规则 |
 | `clearOnBranchSwitch` | `false` | 切换 git 分支时自动清除所有待处理的 hunk |
+| `autoEnable` | `false` | 打开项目时自动启用 hunkwise |
 
 ## .gitignore
 

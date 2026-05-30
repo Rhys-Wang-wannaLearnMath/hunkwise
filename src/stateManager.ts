@@ -2,11 +2,26 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileState } from './types';
-import { HunkwiseGit } from './hunkwiseGit';
+import { HunkwiseGit, Settings } from './hunkwiseGit';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
+import { readTextFile } from './fileContent';
 
 const DEFAULT_IGNORE_PATTERNS = process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'];
+
+export interface ReviewUndoEntry {
+  filePath: string;
+  previousState: FileState | undefined;
+  hunkId?: string;
+  hunkNewStart?: number;
+}
+
+export interface ReviewUndoResult {
+  filePath: string;
+  previousState: FileState | undefined;
+  hunkId?: string;
+  hunkNewStart?: number;
+}
 
 /** Format a list of absolute paths for logging: show relative paths, max 20. */
 function logFileList(files: string[], rootPath: string | undefined): string {
@@ -25,6 +40,7 @@ export class StateManager {
   private _ignorePatterns: string[] = [...DEFAULT_IGNORE_PATTERNS];
   private _respectGitignore: boolean = true;
   private _clearOnBranchSwitch: boolean = false;
+  private _autoEnable: boolean = false;
   private _quoteRotationInterval: number = 30;
   private _useDiffEditor: boolean = false;
   private _showInlineDecorations: boolean = true;
@@ -37,6 +53,9 @@ export class StateManager {
   // (e.g. exitReviewing snapshot fails and reviewing state is restored).
   // Set by the extension to trigger UI refresh after unexpected state restoration.
   onRollback: (() => void) | undefined;
+  onReviewUndoChanged: (() => void) | undefined;
+
+  private reviewUndoStack: ReviewUndoEntry[] = [];
 
   constructor() {
     const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -52,11 +71,16 @@ export class StateManager {
   get ignorePatterns(): string[] { return this._ignorePatterns; }
   get respectGitignore(): boolean { return this._respectGitignore; }
   get clearOnBranchSwitch(): boolean { return this._clearOnBranchSwitch; }
+  get autoEnable(): boolean { return this._autoEnable; }
   get quoteRotationInterval(): number { return this._quoteRotationInterval; }
   get useDiffEditor(): boolean { return this._useDiffEditor; }
   get showInlineDecorations(): boolean { return this._showInlineDecorations; }
   get dir(): string | undefined { return this.hunkwiseDir; }
   get git(): HunkwiseGit | undefined { return this._git; }
+
+  loadSettingsOnly(): Settings | undefined {
+    return this.ensureGit()?.loadSettings();
+  }
 
   /**
    * Walk workspace and collect files that exist on disk but are not tracked in git.
@@ -127,6 +151,7 @@ export class StateManager {
     this._ignorePatterns = settings.ignorePatterns;
     this._respectGitignore = settings.respectGitignore;
     this._clearOnBranchSwitch = settings.clearOnBranchSwitch;
+    this._autoEnable = settings.autoEnable ?? false;
     this._quoteRotationInterval = settings.quoteRotationInterval;
     this._useDiffEditor = settings.useDiffEditor;
     this._showInlineDecorations = settings.showInlineDecorations;
@@ -153,11 +178,12 @@ export class StateManager {
       // Use a single readFile call to avoid TOCTOU race (existsSync + readFile).
       let diskContent: string | undefined;
       let fileDeleted = false;
-      try {
-        diskContent = await fs.promises.readFile(filePath, 'utf-8');
-      } catch (err: any) {
-        if (err?.code === 'ENOENT') { fileDeleted = true; } // file doesn't exist
-        // other errors (e.g. permissions) → diskContent stays undefined, treat as idle
+      const diskRead = await readTextFile(filePath);
+      if (diskRead.ok) {
+        diskContent = diskRead.content;
+      } else {
+        if (diskRead.errorCode === 'ENOENT') { fileDeleted = true; } // file doesn't exist
+        // other errors / non-text files → diskContent stays undefined, treat as idle
       }
       if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
         this.state.set(filePath, { status: 'reviewing', baseline });
@@ -204,6 +230,7 @@ export class StateManager {
     }
 
     log('rebuildState: begin');
+    this.clearReviewUndo();
 
     // Wait for pending git operations to complete before reading
     await this.gitQueue;
@@ -224,10 +251,11 @@ export class StateManager {
       if (baseline === undefined) return;
       let diskContent: string | undefined;
       let fileDeleted = false;
-      try {
-        diskContent = await fs.promises.readFile(filePath, 'utf-8');
-      } catch (err: any) {
-        if (err?.code === 'ENOENT') { fileDeleted = true; }
+      const diskRead = await readTextFile(filePath);
+      if (diskRead.ok) {
+        diskContent = diskRead.content;
+      } else {
+        if (diskRead.errorCode === 'ENOENT') { fileDeleted = true; }
       }
       if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
         this.state.set(filePath, { status: 'reviewing', baseline });
@@ -297,6 +325,83 @@ export class StateManager {
           if (oldState) { this.state.set(filePath, oldState); } else { this.state.delete(filePath); }
           this.onRollback?.();
         }
+      });
+    }
+  }
+
+  recordReviewUndo(filePath: string, hunkId?: string, hunkNewStart?: number): void {
+    filePath = normalizePath(filePath);
+    const previousState = this.state.has(filePath) ? { ...this.state.get(filePath)! } : undefined;
+    this.reviewUndoStack.push({ filePath, previousState, hunkId, hunkNewStart });
+    this.onReviewUndoChanged?.();
+  }
+
+  hasReviewUndo(filePath?: string): boolean {
+    if (this.reviewUndoStack.length === 0) return false;
+    if (filePath === undefined) return true;
+    const normalized = normalizePath(filePath);
+    return this.reviewUndoStack.some(entry => entry.filePath === normalized);
+  }
+
+  clearReviewUndo(filePath?: string): void {
+    if (this.reviewUndoStack.length === 0) return;
+    if (filePath !== undefined) {
+      const normalized = normalizePath(filePath);
+      const next = this.reviewUndoStack.filter(entry => entry.filePath !== normalized);
+      if (next.length === this.reviewUndoStack.length) return;
+      this.reviewUndoStack = next;
+    } else {
+      this.reviewUndoStack = [];
+    }
+    this.onReviewUndoChanged?.();
+  }
+
+  undoLastReviewAction(filePath?: string): ReviewUndoResult | undefined {
+    if (this.reviewUndoStack.length === 0) return undefined;
+
+    let idx = this.reviewUndoStack.length - 1;
+    if (filePath !== undefined) {
+      const normalized = normalizePath(filePath);
+      idx = -1;
+      for (let i = this.reviewUndoStack.length - 1; i >= 0; i--) {
+        if (this.reviewUndoStack[i].filePath === normalized) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx === -1) return undefined;
+    }
+
+    const [entry] = this.reviewUndoStack.splice(idx, 1);
+    this.restoreReviewUndoEntry(entry);
+    this.onReviewUndoChanged?.();
+
+    return {
+      filePath: entry.filePath,
+      previousState: entry.previousState ? { ...entry.previousState } : undefined,
+      hunkId: entry.hunkId,
+      hunkNewStart: entry.hunkNewStart,
+    };
+  }
+
+  private restoreReviewUndoEntry(entry: ReviewUndoEntry): void {
+    if (entry.previousState) {
+      this.state.set(entry.filePath, { ...entry.previousState });
+    } else {
+      this.state.delete(entry.filePath);
+    }
+
+    const g = this._git;
+    if (!g) return;
+
+    if (entry.previousState && entry.previousState.baseline !== null) {
+      const baseline = entry.previousState.baseline;
+      this.gitQueue = this.gitQueue.then(() => g.snapshot(entry.filePath, baseline)).catch(err => {
+        log(`git queue error (undo snapshot): ${err}`);
+      });
+    } else {
+      this.gitQueue = this.gitQueue.then(() => g.removeFile(entry.filePath)).catch(err => {
+        log(`git queue error (undo remove): ${err}`);
       });
     }
   }
@@ -410,6 +515,7 @@ export class StateManager {
   // ── settings ──────────────────────────────────────────────────────────────
 
   async setEnabled(value: boolean): Promise<void> {
+    this.clearReviewUndo();
     this._enabled = value;
     if (value) {
       const g = this.ensureGit();
@@ -419,6 +525,7 @@ export class StateManager {
       this._ignorePatterns = merged.ignorePatterns;
       this._respectGitignore = merged.respectGitignore;
       this._clearOnBranchSwitch = merged.clearOnBranchSwitch;
+      this._autoEnable = merged.autoEnable ?? false;
       this._quoteRotationInterval = merged.quoteRotationInterval;
       this._useDiffEditor = merged.useDiffEditor;
       this._showInlineDecorations = merged.showInlineDecorations;
@@ -463,8 +570,8 @@ export class StateManager {
     const batch: { filePath: string; content: string }[] = [];
     await Promise.all(filePaths.map(async filePath => {
       try {
-        const content = await fs.promises.readFile(filePath, 'utf-8');
-        batch.push({ filePath, content });
+        const read = await readTextFile(filePath);
+        if (read.ok) batch.push({ filePath, content: read.content });
       } catch {
         // Skip binary or unreadable files
       }
@@ -475,7 +582,7 @@ export class StateManager {
   }
 
   private currentSettings() {
-    return { ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations };
+    return { ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, autoEnable: this._autoEnable, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations };
   }
 
   setIgnorePatterns(patterns: string[]): void {
@@ -496,6 +603,13 @@ export class StateManager {
     this._clearOnBranchSwitch = value;
     if (this._enabled && this._git) {
       this._git.saveSettings({ ...this.currentSettings(), clearOnBranchSwitch: value });
+    }
+  }
+
+  setAutoEnable(value: boolean): void {
+    this._autoEnable = value;
+    if (this._enabled && this._git) {
+      this._git.saveSettings({ ...this.currentSettings(), autoEnable: value });
     }
   }
 
@@ -533,6 +647,7 @@ export class StateManager {
     this._ignorePatterns = settings.ignorePatterns;
     this._respectGitignore = settings.respectGitignore;
     this._clearOnBranchSwitch = settings.clearOnBranchSwitch;
+    this._autoEnable = settings.autoEnable ?? false;
     this._quoteRotationInterval = settings.quoteRotationInterval;
     this._useDiffEditor = settings.useDiffEditor;
     this._showInlineDecorations = settings.showInlineDecorations;
@@ -615,8 +730,8 @@ export class StateManager {
       const batch: { filePath: string; content: string }[] = [];
       await Promise.all(toAdd.map(async fp => {
         try {
-          const content = await fs.promises.readFile(fp, 'utf-8');
-          batch.push({ filePath: fp, content });
+          const read = await readTextFile(fp);
+          if (read.ok) batch.push({ filePath: fp, content: read.content });
         } catch { /* skip unreadable */ }
       }));
       if (batch.length > 0) {
@@ -639,6 +754,7 @@ export class StateManager {
     const g = this._git;
     if (!g || !this.workspaceRoot) return;
 
+    this.clearReviewUndo();
     const reviewingCount = Array.from(this.state.values()).filter(s => s.status === 'reviewing').length;
     log(`clearHunksOnBranchSwitch: clearing ${reviewingCount} reviewing file(s), re-syncing all baselines`);
 
@@ -677,8 +793,8 @@ export class StateManager {
     const batch: { filePath: string; content: string }[] = [];
     await Promise.all(diskFiles.map(async fp => {
       try {
-        const content = await fs.promises.readFile(fp, 'utf-8');
-        batch.push({ filePath: fp, content });
+        const read = await readTextFile(fp);
+        if (read.ok) batch.push({ filePath: fp, content: read.content });
       } catch { /* skip unreadable */ }
     }));
 
@@ -700,10 +816,14 @@ export class StateManager {
    * Reset extension to disabled state (called when hunkwiseDir is deleted externally).
    */
   resetToDisabled(): void {
+    this.clearReviewUndo();
     this._enabled = false;
     this._ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
+    this._respectGitignore = true;
+    this._clearOnBranchSwitch = false;
     this._useDiffEditor = false;
     this._showInlineDecorations = true;
+    this._autoEnable = false;
     this.state.clear();
     this._git = undefined;
     this.gitQueue = Promise.resolve();

@@ -32,7 +32,7 @@ hunkwise uses a [proposed VSCode API](https://code.visualstudio.com/api/advanced
 
 Just tell your AI tool:
 
-> Run this skill: <https://github.com/molon/hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
+> Run this skill: <https://github.com/Rhys-Wang-wannaLearnMath/hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
 
 ## Usage
 
@@ -80,6 +80,7 @@ Settings are stored in `.vscode/hunkwise/settings.json` and can be changed via t
 | `ignorePatterns` | `[".git"]` | Glob patterns to exclude from tracking |
 | `respectGitignore` | `true` | Whether to honor `.gitignore` rules |
 | `clearOnBranchSwitch` | `false` | Automatically clear all pending hunks when git branch changes |
+| `autoEnable` | `false` | Automatically enable hunkwise when this project is opened |
 
 ## .gitignore
 

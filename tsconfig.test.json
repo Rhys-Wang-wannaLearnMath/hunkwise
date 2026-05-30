@@ -12,6 +12,7 @@
   "include": [
     "src/test/**/*.ts",
     "src/diffEngine.ts",
+    "src/fileContent.ts",
     "src/hunkwiseGit.ts",
     "src/gitignoreManager.ts",
     "src/pathNormalize.ts"

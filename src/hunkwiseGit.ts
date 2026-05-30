@@ -6,10 +6,11 @@ import { normalizePath } from './pathNormalize';
 
 const execFileAsync = promisify(execFile);
 
-interface Settings {
+export interface Settings {
   ignorePatterns: string[];
   respectGitignore: boolean;
   clearOnBranchSwitch: boolean;
+  autoEnable?: boolean;
   quoteRotationInterval: number;
   useDiffEditor: boolean;
   showInlineDecorations: boolean;
@@ -19,6 +20,7 @@ const DEFAULT_SETTINGS: Settings = {
   ignorePatterns: process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'],
   respectGitignore: true,
   clearOnBranchSwitch: false,
+  autoEnable: false,
   quoteRotationInterval: 30,
   useDiffEditor: false,
   showInlineDecorations: true,
@@ -90,6 +92,7 @@ export class HunkwiseGit {
         ignorePatterns: parsed.ignorePatterns ?? [...DEFAULT_SETTINGS.ignorePatterns],
         respectGitignore: parsed.respectGitignore ?? DEFAULT_SETTINGS.respectGitignore,
         clearOnBranchSwitch: parsed.clearOnBranchSwitch ?? DEFAULT_SETTINGS.clearOnBranchSwitch,
+        autoEnable: parsed.autoEnable ?? DEFAULT_SETTINGS.autoEnable,
         quoteRotationInterval: (typeof parsed.quoteRotationInterval === 'number' && Number.isFinite(parsed.quoteRotationInterval) && parsed.quoteRotationInterval >= 0)
           ? parsed.quoteRotationInterval
           : DEFAULT_SETTINGS.quoteRotationInterval,

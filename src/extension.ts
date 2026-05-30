@@ -7,7 +7,9 @@ import { DecorationManager } from './decorationManager';
 import { ReviewPanel } from './reviewPanel';
 import { registerCommands, acceptHunk, discardHunk } from './commands';
 import { DiffCodeLensProvider } from './diffCodeLens';
+import { canComputeHunks, computeHunks, hunkId } from './diffEngine';
 import { initLog, log } from './log';
+import { upsertGitignore } from './gitignoreManager';
 
 export async function activate(context: vscode.ExtensionContext): Promise<{ getReviewPanel: () => ReviewPanel | undefined; getStateManager: () => StateManager | undefined; getFileWatcher: () => FileWatcher | undefined }> {
   initLog();
@@ -15,6 +17,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
   log(`activate v${ext?.packageJSON?.version ?? '?'}`);
   const stateManager = new StateManager();
   stateManager.onRollback = () => onStateChanged();
+  stateManager.onReviewUndoChanged = () => updateUndoContext();
 
   // Content provider for showing baselines in diff view
   const baselineChangeEmitter = new vscode.EventEmitter<vscode.Uri>();
@@ -39,11 +42,97 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     decorationManager?.refresh();
     reviewPanel?.refresh();
     diffCodeLensProvider?.fire();
+    updateUndoContext();
   }
 
   /** Notify the diff editor that a specific file's baseline changed (only after accept). */
   function fireBaselineChange(filePath: string): void {
     baselineChangeEmitter.fire(vscode.Uri.file(filePath).with({ scheme: 'hunkwise-baseline' }));
+  }
+
+  function activeFilePath(): string | undefined {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.scheme !== 'file') return undefined;
+    return editor.document.uri.fsPath;
+  }
+
+  function updateUndoContext(): void {
+    const filePath = activeFilePath();
+    void vscode.commands.executeCommand(
+      'setContext',
+      'hunkwise.canUndoReviewAction',
+      filePath !== undefined && stateManager.hasReviewUndo(filePath)
+    );
+  }
+
+  function revealRestoredHunk(filePath: string, restoredHunkId?: string, restoredNewStart?: number): void {
+    const fileState = stateManager.getFile(filePath);
+    if (!fileState || fileState.status !== 'reviewing') return;
+    const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.scheme === 'file' && e.document.uri.fsPath === filePath);
+    if (!editor) return;
+
+    if (fileState.diffUnavailable || !canComputeHunks(fileState.baseline, editor.document.getText())) return;
+    const hunks = computeHunks(fileState.baseline, editor.document.getText());
+    const target = (restoredHunkId ? hunks.find(h => hunkId(h) === restoredHunkId) : undefined)
+      ?? (restoredNewStart !== undefined ? hunks.find(h => h.newStart >= restoredNewStart) : undefined)
+      ?? hunks[0];
+    if (!target) return;
+
+    const pos = new vscode.Position(Math.max(0, target.newStart - 1), 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+  }
+
+  function visibleEditorForFile(filePath?: string): vscode.TextEditor | undefined {
+    if (filePath) {
+      return vscode.window.visibleTextEditors.find(
+        e => e.document.uri.scheme === 'file' && e.document.uri.fsPath === filePath
+      );
+    }
+    const editor = vscode.window.activeTextEditor;
+    return editor?.document.uri.scheme === 'file' ? editor : undefined;
+  }
+
+  function navigateHunk(direction: 'previous' | 'next', filePath?: string, fromHunkId?: string): void {
+    const editor = visibleEditorForFile(filePath);
+    if (!editor) return;
+
+    const targetFilePath = editor.document.uri.fsPath;
+    const fileState = stateManager.getFile(targetFilePath);
+    if (!fileState || fileState.status !== 'reviewing') return;
+    const currentText = editor.document.getText();
+    if (fileState.diffUnavailable || !canComputeHunks(fileState.baseline, currentText)) return;
+
+    const hunks = computeHunks(fileState.baseline, currentText);
+    if (hunks.length === 0) return;
+
+    let currentIndex = fromHunkId ? hunks.findIndex(h => hunkId(h) === fromHunkId) : -1;
+    if (currentIndex === -1) {
+      const activeLine = editor.selection.active.line;
+      if (direction === 'next') {
+        currentIndex = hunks.findIndex(h => h.newStart - 1 > activeLine) - 1;
+        if (currentIndex < -1) currentIndex = hunks.length - 1;
+      } else {
+        currentIndex = hunks.findIndex(h => h.newStart - 1 >= activeLine);
+        if (currentIndex === -1) currentIndex = 0;
+      }
+    }
+
+    const delta = direction === 'next' ? 1 : -1;
+    const nextIndex = (currentIndex + delta + hunks.length) % hunks.length;
+    const target = hunks[nextIndex];
+    const pos = new vscode.Position(Math.max(0, target.newStart - 1), 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+  }
+
+  let reviewPanelRefreshTimer: NodeJS.Timeout | undefined;
+  function scheduleReviewPanelRefresh(): void {
+    if (reviewPanelRefreshTimer) clearTimeout(reviewPanelRefreshTimer);
+    reviewPanelRefreshTimer = setTimeout(() => {
+      reviewPanelRefreshTimer = undefined;
+      reviewPanel?.refresh();
+    }, 100);
   }
 
   /**
@@ -100,11 +189,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     fileWatcher.resumeAll();
   }
 
+  if (!stateManager.enabled && stateManager.loadSettingsOnly()?.autoEnable === true) {
+    log('autoEnable=true — enabling hunkwise');
+    reviewPanel?.setLoading(true);
+    fileWatcher.suppressAll();
+    try {
+      await stateManager.setEnabled(true);
+      try { upsertGitignore(); } catch (err) { log(`upsertGitignore failed: ${err}`); }
+      await stateManager.snapshotWorkspace((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+      log('autoEnable complete');
+    } catch (err) {
+      log(`autoEnable failed: ${err}`);
+    } finally {
+      fileWatcher.resumeAll();
+      reviewPanel?.setLoading(false);
+    }
+  }
+
   decorationManager = new DecorationManager(stateManager, (command, filePath, hId) => {
     if (command === 'accept') {
       acceptHunk(stateManager, filePath, hId, () => { onStateChanged(); fireBaselineChange(filePath); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }, 'inset');
-    } else {
+    } else if (command === 'discard') {
       discardHunk(stateManager, fileWatcher, filePath, hId, () => { onStateChanged(); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }, 'inset');
+    } else {
+      navigateHunk(command, filePath, hId);
     }
   });
 
@@ -116,14 +224,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     vscode.window.onDidChangeActiveTextEditor(editor => {
       if (editor) decorationManager?.refresh([editor]);
       diffCodeLensProvider?.fire();
+      updateUndoContext();
     }),
     vscode.workspace.onDidChangeTextDocument(e => {
       if (e.document.uri.scheme !== 'file') return;
+      if (!fileWatcher.isSelfEdit(e.document.uri.fsPath)) {
+        stateManager.clearReviewUndo(e.document.uri.fsPath);
+      }
       const editor = vscode.window.visibleTextEditors.find(
         ed => ed.document.uri.fsPath === e.document.uri.fsPath
       );
-      if (editor) decorationManager?.refresh([editor]);
-      reviewPanel?.refresh();
+      if (editor) decorationManager?.scheduleRefresh([editor]);
+      scheduleReviewPanelRefresh();
     }),
   );
 
@@ -144,6 +256,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     }),
     vscode.commands.registerCommand('hunkwise.codeLensDiscardHunk', (filePath: string, hId: string) => {
       discardHunk(stateManager, fileWatcher, filePath, hId, () => { onStateChanged(); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }, 'codeLens');
+    }),
+    vscode.commands.registerCommand('hunkwise.previousHunk', (filePath?: string, hId?: string) => {
+      navigateHunk('previous', filePath, hId);
+    }),
+    vscode.commands.registerCommand('hunkwise.nextHunk', (filePath?: string, hId?: string) => {
+      navigateHunk('next', filePath, hId);
+    }),
+    vscode.commands.registerCommand('hunkwise.undoReviewAction', async () => {
+      const filePath = activeFilePath();
+      const result = filePath ? stateManager.undoLastReviewAction(filePath) : stateManager.undoLastReviewAction();
+      if (!result) {
+        await vscode.commands.executeCommand('undo');
+        return;
+      }
+      onStateChanged();
+      fireBaselineChange(result.filePath);
+      revealRestoredHunk(result.filePath, result.hunkId, result.hunkNewStart);
     }),
   );
 
@@ -286,7 +415,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
   }
 
   context.subscriptions.push({
-    dispose: () => { decorationManager?.dispose(); },
+    dispose: () => {
+      if (reviewPanelRefreshTimer) clearTimeout(reviewPanelRefreshTimer);
+      decorationManager?.dispose();
+    },
   });
 
   activeStateManager = stateManager;

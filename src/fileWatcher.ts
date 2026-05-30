@@ -5,9 +5,10 @@ import * as path from 'path';
 const ignoreLib: ((options?: { ignoreCase?: boolean }) => import('ignore').Ignore) & typeof import('ignore') = require('ignore');
 type Ignore = import('ignore').Ignore;
 import { StateManager } from './stateManager';
-import { computeHunks } from './diffEngine';
+import { canComputeHunks, computeHunks } from './diffEngine';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
+import { readTextFile, TextFileReadResult } from './fileContent';
 
 // Transform gitignore rules from a sub-directory so they work in a single
 // root-level matcher. Adds the directory's relative path as prefix, handling
@@ -211,6 +212,10 @@ export class FileWatcher {
     this.selfEditFiles.delete(normalizePath(filePath));
   }
 
+  isSelfEdit(filePath: string): boolean {
+    return this.selfEditFiles.has(normalizePath(filePath));
+  }
+
   shouldIgnore(filePath: string, isDirectory?: boolean): boolean {
     if (!filePath) return false;
 
@@ -265,15 +270,14 @@ export class FileWatcher {
     log(`onDiskCreate(${basename}): fileState=${fileState ? `{status:${fileState.status}, baseline.len:${fileState.baseline?.length ?? 'null'}}` : 'undefined'}`);
     if (fileState?.status === 'reviewing') {
       // File was deleted (showing deletion hunk) but now re-created — recompute
-      let diskContent: string;
-      try {
-        diskContent = await fs.promises.readFile(filePath, 'utf-8');
-      } catch {
-        log(`onDiskCreate(${basename}): read failed while reviewing, skip`);
+      const diskRead = await readTextFile(filePath);
+      if (!diskRead.ok) {
+        log(`onDiskCreate(${basename}): text read unavailable while reviewing (${diskRead.reason}), keeping file-level review`);
+        this.markReviewingUnavailable(filePath, fileState.baseline, diskRead);
         return;
       }
-      log(`onDiskCreate(${basename}): reviewing, recompute hunks (baseline.len=${fileState.baseline?.length ?? 'null'}, disk.len=${diskContent.length})`);
-      this.recomputeHunks(filePath, fileState.baseline, diskContent);
+      log(`onDiskCreate(${basename}): reviewing, recompute hunks (baseline.len=${fileState.baseline?.length ?? 'null'}, disk.len=${diskRead.content.length})`);
+      this.recomputeHunks(filePath, fileState.baseline, diskRead.content);
       return;
     }
     if (fileState) { log(`onDiskCreate(${basename}): has fileState but not reviewing, skip`); return; }
@@ -281,11 +285,11 @@ export class FileWatcher {
     const git = this.stateManager.git;
     if (!git) { log(`onDiskCreate(${basename}): no git, skip`); return; }
 
-    let diskContent: string;
-    try {
-      diskContent = await fs.promises.readFile(filePath, 'utf-8');
-    } catch {
-      log(`onDiskCreate(${basename}): read failed, skip`);
+    const diskRead = await readTextFile(filePath);
+    if (!diskRead.ok) {
+      const gitBaseline = await git.getBaseline(filePath);
+      log(`onDiskCreate(${basename}): text read unavailable (${diskRead.reason}), enter file-level review`);
+      this.markReviewingUnavailable(filePath, gitBaseline ?? null, diskRead);
       return;
     }
 
@@ -294,24 +298,24 @@ export class FileWatcher {
     if (gitBaseline !== undefined) {
       // Hunkwise already has a baseline — treat as a change
       log(`onDiskCreate(${basename}): has baseline, enterReviewing as change`);
-      this.enterReviewing(filePath, gitBaseline, diskContent);
+      this.enterReviewing(filePath, gitBaseline, diskRead.content);
       return;
     }
 
     // Check if this was a manual create in VSCode (editor buffer matches disk)
     const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
-    const bufferMatch = openDoc ? openDoc.getText() === diskContent : false;
+    const bufferMatch = openDoc ? openDoc.getText() === diskRead.content : false;
     log(`onDiskCreate(${basename}): openDoc=${!!openDoc}, bufferMatch=${bufferMatch}`);
     if (openDoc && bufferMatch) {
       // User created/saved this file in VSCode — snapshot as baseline, no hunk
       log(`onDiskCreate(${basename}): buffer matches disk, snapshot as baseline`);
-      this.stateManager.snapshotFile(filePath, diskContent);
+      this.stateManager.snapshotFile(filePath, diskRead.content);
       return;
     }
 
     // External tool created this file — show as new file hunk (null = file didn't exist before)
     log(`onDiskCreate(${basename}): external create, enterReviewing as NEW`);
-    this.enterReviewing(filePath, null, diskContent);
+    this.enterReviewing(filePath, null, diskRead.content);
   }
 
   private async onDiskDelete(uri: vscode.Uri): Promise<void> {
@@ -412,10 +416,8 @@ export class FileWatcher {
     if (this.shouldIgnore(filePath)) return;
     if (this.selfEditFiles.has(filePath)) return;
 
-    let diskContent: string;
-    try {
-      diskContent = await fs.promises.readFile(filePath, 'utf-8');
-    } catch {
+    const diskRead = await readTextFile(filePath);
+    if (!diskRead.ok && diskRead.errorCode === 'ENOENT') {
       return;
     }
 
@@ -423,7 +425,11 @@ export class FileWatcher {
 
     if (fileState?.status === 'reviewing') {
       // Already has diff — recompute against known baseline
-      this.recomputeHunks(filePath, fileState.baseline, diskContent);
+      if (diskRead.ok) {
+        this.recomputeHunks(filePath, fileState.baseline, diskRead.content);
+      } else {
+        this.markReviewingUnavailable(filePath, fileState.baseline, diskRead);
+      }
       return;
     }
 
@@ -432,14 +438,20 @@ export class FileWatcher {
 
     // Check if this was a manual save in VSCode (editor buffer matches disk)
     const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
-    if (openDoc && openDoc.getText() === diskContent) {
+    if (diskRead.ok && openDoc && openDoc.getText() === diskRead.content) {
       // User saved in VSCode — accept into baseline, no hunk
-      this.stateManager.snapshotFile(filePath, diskContent);
+      this.stateManager.snapshotFile(filePath, diskRead.content);
       return;
     }
 
     // External change — compare against hunkwise baseline
     const gitBaseline = await git.getBaseline(filePath);
+    if (!diskRead.ok) {
+      if (gitBaseline !== undefined) {
+        this.markReviewingUnavailable(filePath, gitBaseline, diskRead);
+      }
+      return;
+    }
     if (gitBaseline === undefined) {
       // No baseline in git — silently adopt current content as baseline rather than
       // treating as a new file. This avoids false "new file" hunks in cases like:
@@ -449,10 +461,10 @@ export class FileWatcher {
       // Genuine new files created while hunkwise is running are caught by onDidCreate,
       // not this path. This is intentionally consistent with syncIgnoreState's toAdd
       // behavior which also silently snapshots.
-      this.stateManager.snapshotFile(filePath, diskContent);
+      this.stateManager.snapshotFile(filePath, diskRead.content);
       return;
     }
-    this.enterReviewing(filePath, gitBaseline, diskContent);
+    this.enterReviewing(filePath, gitBaseline, diskRead.content);
   }
 
   private onDocumentChange(e: vscode.TextDocumentChangeEvent): void {
@@ -480,6 +492,11 @@ export class FileWatcher {
   }
 
   private enterReviewing(filePath: string, baseline: string | null, current: string): void {
+    if (!canComputeHunks(baseline, current)) {
+      this.markReviewingUnavailable(filePath, baseline, { ok: false, reason: 'tooLarge' });
+      return;
+    }
+
     const hunks = computeHunks(baseline, current);
     const isNew = baseline === null;
     const isDeleted = !fs.existsSync(filePath) && baseline !== null;
@@ -492,7 +509,13 @@ export class FileWatcher {
   }
 
   private recomputeHunks(filePath: string, baseline: string | null, current: string): void {
-    if (computeHunks(baseline, current).length === 0) {
+    if (!canComputeHunks(baseline, current)) {
+      this.markReviewingUnavailable(filePath, baseline, { ok: false, reason: 'tooLarge' });
+      return;
+    }
+
+    const hunks = computeHunks(baseline, current);
+    if (hunks.length === 0) {
       // No diff remaining — exit reviewing.
       // For null-baseline (new) files with empty current, keep reviewing
       // so the user can still accept/discard.
@@ -501,7 +524,20 @@ export class FileWatcher {
         return;
       }
       this.stateManager.exitReviewing(filePath);
+    } else if (this.stateManager.getFile(filePath)?.diffUnavailable) {
+      this.stateManager.setFile(filePath, { status: 'reviewing', baseline }, true);
     }
+    this.onStateChanged();
+  }
+
+  private markReviewingUnavailable(filePath: string, baseline: string | null, read: Extract<TextFileReadResult, { ok: false }>): void {
+    log(`reviewing: ${path.basename(filePath)} (${read.reason}, file-level)`);
+    this.stateManager.setFile(filePath, {
+      status: 'reviewing',
+      baseline,
+      diffUnavailable: true,
+      diffUnavailableReason: read.reason,
+    }, true);
     this.onStateChanged();
   }
 

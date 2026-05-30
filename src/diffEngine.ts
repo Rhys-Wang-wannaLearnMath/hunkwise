@@ -9,6 +9,37 @@ export interface ParsedHunk {
   addedContent: string[];    // lines in current content that were added
 }
 
+export const MAX_DIFF_INPUT_CHARS = 1_500_000;
+export const MAX_DIFF_INPUT_LINES = 50000;
+const MAX_CACHED_DIFFS = 12;
+const MAX_CACHED_DIFF_CHARS = 300_000;
+
+interface CachedDiff {
+  baseline: string | null;
+  current: string;
+  hunks: ParsedHunk[];
+}
+
+// Diff results are requested repeatedly by decorations, CodeLens, navigation,
+// and the review panel for the same document version. Keep a deliberately small
+// cache so those callers share the expensive diffLines result without retaining
+// large editor buffers indefinitely.
+const diffCache: CachedDiff[] = [];
+
+function countLines(s: string): number {
+  let lines = 1;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 10) lines++;
+  }
+  return lines;
+}
+
+export function canComputeHunks(baseline: string | null, current: string): boolean {
+  const base = baseline ?? '';
+  if (base.length + current.length > MAX_DIFF_INPUT_CHARS) return false;
+  return countLines(base) + countLines(current) <= MAX_DIFF_INPUT_LINES;
+}
+
 // Stable id derived from hunk position — same hunk always gets the same id
 // within a single review session (no random component needed).
 export function hunkId(hunk: ParsedHunk): string {
@@ -16,6 +47,13 @@ export function hunkId(hunk: ParsedHunk): string {
 }
 
 export function computeHunks(baseline: string | null, current: string): ParsedHunk[] {
+  const cachedIndex = diffCache.findIndex(entry => entry.baseline === baseline && entry.current === current);
+  if (cachedIndex !== -1) {
+    const [cached] = diffCache.splice(cachedIndex, 1);
+    diffCache.push(cached);
+    return cached.hunks;
+  }
+
   const changes = Diff.diffLines(baseline ?? '', current);
 
   const hunks: ParsedHunk[] = [];
@@ -70,6 +108,10 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
     }
   }
 
+  if ((baseline?.length ?? 0) + current.length <= MAX_CACHED_DIFF_CHARS) {
+    diffCache.push({ baseline, current, hunks });
+    if (diffCache.length > MAX_CACHED_DIFFS) diffCache.shift();
+  }
+
   return hunks;
 }
-

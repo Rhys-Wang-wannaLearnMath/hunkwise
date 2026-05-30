@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/molon/hunkwise"
+    "url": "https://github.com/Rhys-Wang-wannaLearnMath/hunkwise"
   },
   "engines": {
     "vscode": "^1.90.0"
@@ -42,6 +42,26 @@
         "command": "hunkwise.refresh",
         "title": "hunkwise: Refresh State",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "hunkwise.undoReviewAction",
+        "title": "hunkwise: Undo Review Action"
+      },
+      {
+        "command": "hunkwise.previousHunk",
+        "title": "hunkwise: Previous Change"
+      },
+      {
+        "command": "hunkwise.nextHunk",
+        "title": "hunkwise: Next Change"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "hunkwise.undoReviewAction",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "editorTextFocus && hunkwise.canUndoReviewAction"
       }
     ],
     "menus": {

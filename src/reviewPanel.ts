@@ -3,8 +3,9 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { StateManager } from './stateManager';
 import { FileWatcher } from './fileWatcher';
-import { computeHunks, hunkId } from './diffEngine';
+import { canComputeHunks, computeHunks, hunkId } from './diffEngine';
 import { log } from './log';
+import { readTextFileSync } from './fileContent';
 
 import {
   acceptAllFiles,
@@ -20,10 +21,12 @@ interface PanelState {
   ignorePatterns: string[];
   respectGitignore: boolean;
   clearOnBranchSwitch: boolean;
+  autoEnable: boolean;
   quoteRotationInterval: number;
   useDiffEditor: boolean;
   showInlineDecorations: boolean;
   totalFiles: number;
+  totalHunks: number;
   totalAdded: number;
   totalRemoved: number;
   files: PanelFile[];
@@ -38,6 +41,7 @@ interface PanelFile {
   pendingCount: number;
   isNew: boolean;
   isDeleted: boolean;
+  diffUnavailable: boolean;
   hunks: PanelHunk[];
 }
 
@@ -112,6 +116,7 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
 
   private buildPanelState(): PanelState {
     const files: PanelFile[] = [];
+    let totalHunks = 0;
     let totalAdded = 0;
     let totalRemoved = 0;
 
@@ -120,25 +125,36 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
 
       const fileExists = fs.existsSync(filePath);
       let currentContent: string;
+      let diskTextUnavailable = false;
       if (!fileExists) {
         currentContent = '';
       } else {
         const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
         currentContent = doc ? doc.getText() : '';
         if (!doc) {
-          try { currentContent = fs.readFileSync(filePath, 'utf-8'); } catch { currentContent = ''; }
+          const read = readTextFileSync(filePath);
+          if (read.ok) {
+            currentContent = read.content;
+          } else {
+            currentContent = '';
+            diskTextUnavailable = true;
+          }
         }
       }
 
-      const pendingHunks = computeHunks(fileState.baseline, currentContent);
       const isNew = fileState.baseline === null;
       const isDeleted = !fileExists && fileState.baseline !== null;
+      const diffUnavailable = !!fileState.diffUnavailable
+        || (fileExists && diskTextUnavailable)
+        || !canComputeHunks(fileState.baseline, currentContent);
+      const pendingHunks = diffUnavailable ? [] : computeHunks(fileState.baseline, currentContent);
       // Show 0-hunk entries for new files (null baseline, e.g. new empty file)
       // and deleted files (file missing from disk) so accept/discard remain available.
-      if (pendingHunks.length === 0 && !isNew && !isDeleted) continue;
+      if (pendingHunks.length === 0 && !isNew && !isDeleted && !diffUnavailable) continue;
 
       const addedLines = pendingHunks.reduce((s, h) => s + h.newLines, 0);
       const removedLines = pendingHunks.reduce((s, h) => s + h.oldLines, 0);
+      totalHunks += pendingHunks.length;
       totalAdded += addedLines;
       totalRemoved += removedLines;
 
@@ -157,6 +173,7 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
         pendingCount: pendingHunks.length,
         isNew,
         isDeleted,
+        diffUnavailable,
         hunks: pendingHunks.map(h => ({
           id: hunkId(h),
           filePath,
@@ -174,10 +191,12 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
       ignorePatterns: this.stateManager.ignorePatterns,
       respectGitignore: this.stateManager.respectGitignore,
       clearOnBranchSwitch: this.stateManager.clearOnBranchSwitch,
+      autoEnable: this.stateManager.autoEnable,
       quoteRotationInterval: this.stateManager.quoteRotationInterval,
       useDiffEditor: this.stateManager.useDiffEditor,
       showInlineDecorations: this.stateManager.showInlineDecorations,
       totalFiles: files.length,
+      totalHunks,
       totalAdded,
       totalRemoved,
       files,
@@ -211,6 +230,11 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
       case 'setClearOnBranchSwitch':
         if (msg.value !== undefined) {
           this.stateManager.setClearOnBranchSwitch(msg.value);
+        }
+        break;
+      case 'setAutoEnable':
+        if (msg.value !== undefined) {
+          this.stateManager.setAutoEnable(msg.value);
         }
         break;
       case 'setQuoteRotationInterval': {
@@ -280,7 +304,9 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
             const fileState = this.stateManager.getFile(msg.filePath);
             const doc = await vscode.window.showTextDocument(vscode.Uri.file(msg.filePath));
             if (fileState) {
-              const hunks = computeHunks(fileState.baseline, doc.document.getText());
+              const hunks = fileState.diffUnavailable || !canComputeHunks(fileState.baseline, doc.document.getText())
+                ? []
+                : computeHunks(fileState.baseline, doc.document.getText());
               if (hunks.length > 0) {
                 const pos = new vscode.Position(Math.max(0, hunks[0].newStart - 1), 0);
                 doc.selection = new vscode.Selection(pos, pos);
@@ -307,8 +333,10 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
             const fileState = this.stateManager.getFile(msg.filePath);
             if (fileState) {
               const doc = await vscode.window.showTextDocument(vscode.Uri.file(msg.filePath));
-              const hunk = computeHunks(fileState.baseline, doc.document.getText())
-                .find(h => hunkId(h) === msg.hunkId);
+              const hunk = fileState.diffUnavailable || !canComputeHunks(fileState.baseline, doc.document.getText())
+                ? undefined
+                : computeHunks(fileState.baseline, doc.document.getText())
+                  .find(h => hunkId(h) === msg.hunkId);
               if (hunk) {
                 const pos = new vscode.Position(Math.max(0, hunk.newStart - 1), 0);
                 doc.selection = new vscode.Selection(pos, pos);
@@ -336,7 +364,9 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
     );
     const editor = candidates.find(e => e.viewColumn === undefined) ?? candidates[0];
     if (fileState && editor) {
-      const hunks = computeHunks(fileState.baseline, editor.document.getText());
+      const hunks = fileState.diffUnavailable || !canComputeHunks(fileState.baseline, editor.document.getText())
+        ? []
+        : computeHunks(fileState.baseline, editor.document.getText());
       const target = targetHunkId
         ? hunks.find(h => hunkId(h) === targetHunkId)
         : hunks[0];

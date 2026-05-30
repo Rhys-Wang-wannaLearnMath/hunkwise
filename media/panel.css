@@ -606,6 +606,10 @@ body {
   background: rgba(248, 81, 73, 0.15);
   color: #f85149;
 }
+.file-status-file {
+  background: color-mix(in srgb, var(--vscode-badge-background) 28%, transparent);
+  color: var(--vscode-badge-foreground);
+}
 
 /* ── Disable button on idle screen ── */
 .btn-disable {

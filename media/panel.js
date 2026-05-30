@@ -3,7 +3,7 @@
 const vscode = /** @type {any} */ (globalThis).acquireVsCodeApi();
 const app = document.getElementById('app');
 
-/** @type {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, totalFiles: number, totalAdded: number, totalRemoved: number, files: any[] } | null} */
+/** @type {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] } | null} */
 let currentState = null;
 /** @type {Set<string>} */
 const expandedFiles = new Set();
@@ -121,7 +121,7 @@ function appendIcon(parent) {
 }
 
 /**
- * @param {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, totalFiles: number, totalAdded: number, totalRemoved: number, files: any[] }} state
+ * @param {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] }} state
  */
 function render(state) {
   if (!app) return;
@@ -196,7 +196,7 @@ function renderIdleScreen(quoteRotationInterval) {
 }
 
 /**
- * @param {{ ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean }} state
+ * @param {{ ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean }} state
  */
 function renderSettingsScreen(state) {
   if (!app) return;
@@ -247,6 +247,22 @@ function renderSettingsScreen(state) {
   branchDescRow.appendChild(el('span', 'settings-check-desc', 'Automatically clear pending hunks when you switch branches'));
   branchRow.appendChild(branchDescRow);
   gitignoreSection.appendChild(branchRow);
+
+  // Auto-enable
+  const autoEnableRow = el('label', 'settings-check-row');
+  autoEnableRow.appendChild(el('span', 'settings-check-label', 'Auto enable on project open'));
+  const autoEnableDescRow = el('div', 'settings-check-desc-row');
+  const autoEnableCheckbox = /** @type {HTMLInputElement} */ (document.createElement('input'));
+  autoEnableCheckbox.type = 'checkbox';
+  autoEnableCheckbox.className = 'settings-checkbox';
+  autoEnableCheckbox.checked = state.autoEnable;
+  autoEnableCheckbox.addEventListener('change', () => {
+    vscode.postMessage({ command: 'setAutoEnable', value: autoEnableCheckbox.checked });
+  });
+  autoEnableDescRow.appendChild(autoEnableCheckbox);
+  autoEnableDescRow.appendChild(el('span', 'settings-check-desc', 'Automatically enable hunkwise when this project is opened'));
+  autoEnableRow.appendChild(autoEnableDescRow);
+  gitignoreSection.appendChild(autoEnableRow);
 
   // ── Appearance ──
   const appearanceSection = el('div', 'settings-section');
@@ -408,7 +424,7 @@ function fileIconBadge(fileName) {
 }
 
 /**
- * @param {{ enabled: boolean, ignorePatterns: string[], totalFiles: number, totalAdded: number, totalRemoved: number, files: any[] }} state
+ * @param {{ enabled: boolean, ignorePatterns: string[], totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] }} state
  */
 function renderReviewScreen(state) {
   if (!app) return;
@@ -416,7 +432,7 @@ function renderReviewScreen(state) {
   // Summary header
   const header = el('div', 'review-header');
   const summary = el('div', 'review-summary');
-  summary.appendChild(document.createTextNode(`${state.totalFiles} file${state.totalFiles > 1 ? 's' : ''} `));
+  summary.appendChild(document.createTextNode(`${state.totalHunks} change${state.totalHunks !== 1 ? 's' : ''} · ${state.totalFiles} file${state.totalFiles > 1 ? 's' : ''} `));
   summary.appendChild(el('span', 'stat-added', `+${state.totalAdded}`));
   summary.appendChild(document.createTextNode(' '));
   summary.appendChild(el('span', 'stat-removed', `-${state.totalRemoved}`));
@@ -433,10 +449,10 @@ function renderReviewScreen(state) {
 }
 
 /**
- * @param {{ filePath: string, fileName: string, dirName: string, addedLines: number, removedLines: number, pendingCount: number, isNew: boolean, isDeleted: boolean, hunks: any[] }} file
+ * @param {{ filePath: string, fileName: string, dirName: string, addedLines: number, removedLines: number, pendingCount: number, isNew: boolean, isDeleted: boolean, diffUnavailable?: boolean, hunks: any[] }} file
  */
 function renderFileGroup(file) {
-  const isSpecial = file.isNew || file.isDeleted;
+  const isSpecial = file.isNew || file.isDeleted || file.diffUnavailable;
   const isExpanded = !isSpecial && expandedFiles.has(file.filePath);
   const group = el('div', 'file-group');
 
@@ -473,6 +489,7 @@ function renderFileGroup(file) {
   }
   const badge = file.isNew ? el('span', 'file-status-badge file-status-new', 'new')
     : file.isDeleted ? el('span', 'file-status-badge file-status-deleted', 'deleted')
+    : file.diffUnavailable ? el('span', 'file-status-badge file-status-file', 'file')
     : null;
   const dir = file.dirName ? el('span', 'file-dir', file.dirName) : null;
 

@@ -4,9 +4,10 @@ import * as path from 'path';
 import { StateManager } from './stateManager';
 import { FileWatcher } from './fileWatcher';
 import { ReviewPanel } from './reviewPanel';
-import { computeHunks, hunkId } from './diffEngine';
+import { canComputeHunks, computeHunks, hunkId } from './diffEngine';
 import { upsertGitignore } from './gitignoreManager';
 import { log } from './log';
+import { readTextFileSync } from './fileContent';
 
 export function registerCommands(
   context: vscode.ExtensionContext,
@@ -104,9 +105,11 @@ export async function discardAllFiles(
 export function acceptFileByPath(
   stateManager: StateManager,
   filePath: string,
-  onStateChanged: () => void
+  onStateChanged: () => void,
+  recordUndo: boolean = true
 ): void {
   if (!stateManager.getFile(filePath)) return;
+  if (recordUndo) stateManager.recordReviewUndo(filePath);
   const basename = path.basename(filePath);
   if (!fs.existsSync(filePath)) {
     // File was deleted — remove from tracking entirely
@@ -114,9 +117,16 @@ export function acceptFileByPath(
     stateManager.removeFile(filePath);
   } else {
     // File exists (possibly empty) — accept current content as new baseline
-    const content = fs.readFileSync(filePath, 'utf-8');
-    log(`acceptFileByPath(${basename}): file exists, exitReviewing with content.len=${content.length}`);
-    stateManager.exitReviewing(filePath, content);
+    const read = readTextFileSync(filePath);
+    if (read.ok) {
+      log(`acceptFileByPath(${basename}): file exists, exitReviewing with content.len=${read.content.length}`);
+      stateManager.exitReviewing(filePath, read.content);
+    } else {
+      // Non-text or very large files cannot be snapshotted as line-review baselines.
+      // Treat file-level accept as accepting and untracking that file.
+      log(`acceptFileByPath(${basename}): text read unavailable (${read.reason}), removeFile`);
+      stateManager.removeFile(filePath);
+    }
   }
   onStateChanged();
 }
@@ -197,12 +207,17 @@ export function acceptHunk(
   const baselineStr = fileState.baseline ?? '';
   log(`acceptHunk(${basename}): doc.scheme=${doc.uri.scheme}, doc.len=${doc.getText().length}, baseline.len=${baselineStr.length}`);
 
+  if (fileState.diffUnavailable || !canComputeHunks(fileState.baseline, doc.getText())) {
+    log(`acceptHunk(${basename}): diff unavailable, skip`);
+    return;
+  }
   const hunks = computeHunks(fileState.baseline, doc.getText());
   log(`acceptHunk(${basename}): total hunks=${hunks.length}`);
   const hunk = hunks.find(h => hunkId(h) === id);
   if (!hunk) { log(`acceptHunk(${basename}): hunk not found, skip`); return; }
 
   const originalNewStart = hunk.newStart;
+  stateManager.recordReviewUndo(filePath, id, originalNewStart);
 
   const currentLines = doc.getText().split('\n');
   const baselineLines = baselineStr.split('\n');
@@ -219,24 +234,9 @@ export function acceptHunk(
     stateManager.exitReviewing(filePath, doc.getText());
   } else {
     stateManager.setFile(filePath, { status: 'reviewing', baseline: newBaseline });
-    revealNextHunk(filePath, remainingHunks, originalNewStart);
   }
   onStateChanged();
   log(`acceptHunk(${basename}): done`);
-}
-
-/** Reveal the next hunk in the editor after an accept/discard operation. */
-function revealNextHunk(filePath: string, remainingHunks: ReturnType<typeof computeHunks>, originalNewStart: number): void {
-  const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.fsPath === filePath);
-  if (!editor) return;
-
-  // Find the first remaining hunk at or after the original position
-  const next = remainingHunks.find(h => h.newStart >= originalNewStart) ?? remainingHunks[0];
-  if (!next) return;
-
-  const pos = new vscode.Position(Math.max(0, next.newStart - 1), 0);
-  editor.selection = new vscode.Selection(pos, pos);
-  editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
 }
 
 export async function discardHunk(
@@ -256,12 +256,14 @@ export async function discardHunk(
   const uri = vscode.Uri.file(filePath);
   const doc = await vscode.workspace.openTextDocument(uri);
 
+  if (fileState.diffUnavailable || !canComputeHunks(fileState.baseline, doc.getText())) {
+    log(`discardHunk(${basename}): diff unavailable, skip`);
+    return;
+  }
   const allHunks = computeHunks(fileState.baseline, doc.getText());
   log(`discardHunk(${basename}): total hunks=${allHunks.length}`);
   const hunk = allHunks.find(h => hunkId(h) === id);
   if (!hunk) { log(`discardHunk(${basename}): hunk not found, skip`); return; }
-
-  const originalNewStart = hunk.newStart;
 
   const baselineStr = fileState.baseline ?? '';
   const baselineLines = baselineStr.split('\n');
@@ -305,8 +307,6 @@ export async function discardHunk(
       }
       log(`discardHunk(${basename}): no hunks left, exitReviewing`);
       stateManager.exitReviewing(filePath);
-    } else {
-      revealNextHunk(filePath, remainingHunks, originalNewStart);
     }
     onStateChanged();
     log(`discardHunk(${basename}): done`);
@@ -314,4 +314,3 @@ export async function discardHunk(
     fileWatcher.clearSelfEdit(filePath);
   }
 }
-
