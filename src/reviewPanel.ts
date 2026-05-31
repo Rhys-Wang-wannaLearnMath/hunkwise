@@ -71,6 +71,7 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
+    webviewView.title = '';
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [
