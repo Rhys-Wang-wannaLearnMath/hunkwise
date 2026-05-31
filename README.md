@@ -1,4 +1,4 @@
-# hunkwise
+# native-hunkwise
 
 <!-- markdownlint-disable MD033 -->
 <p align="center">
@@ -8,19 +8,21 @@
 <p align="center"><em>Your future self will thank you. Or blame you. It depends on the diff.</em></p>
 <!-- markdownlint-enable MD033 -->
 
-Per-hunk Accept/Discard for any file change in VSCode.
+Per-hunk Accept/Discard for any file change in VSCode, built on native inline diff.
 
 AI coding tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://github.com/anomalyco/opencode), and other CLI/plugin-based assistants lack a native IDE — unlike Cursor, Windsurf, or Copilot, they have no built-in way to review changes hunk by hunk.
 
-**hunkwise** fills that gap by bringing per-hunk review controls directly into VSCode for any external file change.
+**native-hunkwise** is the native-diff refactor of hunkwise. The GitHub project is now `native-hunkwise`, while the VSCode extension still appears as **hunkwise** so existing commands, settings, and installs remain compatible.
+
+This refactor removes the old custom webview/editor-inset diff rendering path and uses VSCode's native inline diff editor plus CodeLens for hunk navigation and Accept/Discard actions.
 
 ![snapshot](media/snapshot.png)
 
 ## Features
 
 - Tracks file changes from any source (AI tools, scripts, manual edits)
-- Per-hunk `✓ Accept | ↺ Discard` controls inline in the editor
-- Added lines highlighted in green, removed lines highlighted in red
+- Per-hunk `Previous | Hunk 1/N | Next | Accept Hunk | Discard Hunk` CodeLens actions in the editor and native inline diff
+- Native inline diff uses VSCode's built-in green/red change rendering
 - Sidebar panel lists all pending files with hunk details and batch actions
 - New files and deleted files are tracked and displayed
 - State persisted across VSCode restarts via a lightweight internal git repo
@@ -28,11 +30,11 @@ AI coding tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-cod
 
 ## Installation
 
-hunkwise uses a [proposed VSCode API](https://code.visualstudio.com/api/advanced-topics/using-proposed-api) (`editorInsets`) and cannot be installed from the marketplace.
+hunkwise no longer depends on proposed VSCode APIs; the review view is built on VSCode's native inline diff editor and CodeLens.
 
 Just tell your AI tool:
 
-> Run this skill: <https://github.com/Rhys-Wang-wannaLearnMath/hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
+> Run this skill: <https://github.com/Rhys-Wang-wannaLearnMath/native-hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
 
 ## Usage
 
@@ -46,7 +48,7 @@ Once enabled, any external tool (AI assistant, script, etc.) that writes to a fi
 
 ### Reviewing changes
 
-- Click `✓` or `↺` above each hunk in the editor
+- Click `Accept` or `Discard` above each hunk in the editor or native inline diff
 - Use the **hunkwise** sidebar panel to:
   - See all files with pending changes
   - Accept or discard individual hunks
@@ -81,6 +83,8 @@ Settings are stored in `.vscode/hunkwise/settings.json` and can be changed via t
 | `respectGitignore` | `true` | Whether to honor `.gitignore` rules |
 | `clearOnBranchSwitch` | `false` | Automatically clear all pending hunks when git branch changes |
 | `autoEnable` | `false` | Automatically enable hunkwise when this project is opened |
+| `useDiffEditor` | `true` | Open panel file/hunk clicks in VSCode's native inline diff editor |
+| `showInlineDecorations` | `true` | Show normal-editor added-line highlights and CodeLens actions |
 
 ## .gitignore
 
@@ -92,16 +96,11 @@ When enabled, hunkwise automatically adds `.vscode/hunkwise/` to your `.gitignor
 
 When hunkwise is enabled, it snapshots all workspace files into a private git repository at `.vscode/hunkwise/git/`. This repo stores **baselines** — the content of each file at the moment hunkwise starts tracking. The repo always has exactly one commit (each mutation does `--amend`).
 
-When an external tool modifies a file, hunkwise diffs the current content against the stored baseline to produce hunks. Accepting a hunk updates the baseline; discarding a hunk restores the baseline content.
+When a tracked file changes, hunkwise diffs the current content against the stored baseline to produce hunks. Accepting a hunk updates the baseline; discarding a hunk restores the baseline content.
 
-### External vs manual change detection
+### Change detection
 
-hunkwise distinguishes between:
-
-- **External changes** (AI tools, scripts): Detected when the file content on disk differs from the open editor buffer. These trigger review mode with inline hunks.
-- **Manual edits** (user typing in VSCode): The editor buffer matches the disk content after save. These silently update the baseline — no hunks shown.
-
-This means you can freely edit files while hunkwise is enabled, and only tool-generated changes will produce hunks.
+hunkwise treats saved changes from scripts, AI tools, VSCode extensions, and the editor as reviewable changes. This avoids missing tool-generated edits that are applied through VSCode's document APIs rather than direct disk writes.
 
 ### File rename and delete handling
 

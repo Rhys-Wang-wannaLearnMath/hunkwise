@@ -6,7 +6,6 @@ export default defineConfig({
   installPath: '/Applications/Visual Studio Code - Insiders.app',
   workspaceFolder: path.resolve('src/test/integration/workspace'),
   launchArgs: [
-    '--enable-proposed-api=molon.hunkwise',
     '--disable-extensions',
     '--disable-gpu',
   ],

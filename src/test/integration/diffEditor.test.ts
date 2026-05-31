@@ -5,6 +5,7 @@ import {
   getWorkspaceRoot, gitGetBaseline,
   sleep, waitForCondition, enableHunkwise, disableHunkwise,
   writeFileExternally, cleanWorkspace, getStateManager, getFileWatcher,
+  getReviewPanel,
 } from './helpers';
 import { acceptHunk, discardHunk } from '../../commands';
 import { computeHunks, hunkId } from '../../diffEngine';
@@ -46,16 +47,16 @@ suite('hunkwise diff editor integration', function () {
 
   // ── useDiffEditor setting ──────────────────────────────────────────────────
 
-  test('useDiffEditor setting persists and defaults to false', async () => {
+  test('useDiffEditor setting persists and defaults to true', async () => {
     await enableHunkwise();
     const sm = getStateManager();
-    assert.strictEqual(sm.useDiffEditor, false, 'useDiffEditor should default to false');
-
-    sm.setUseDiffEditor(true);
-    assert.strictEqual(sm.useDiffEditor, true);
+    assert.strictEqual(sm.useDiffEditor, true, 'useDiffEditor should default to true');
 
     sm.setUseDiffEditor(false);
     assert.strictEqual(sm.useDiffEditor, false);
+
+    sm.setUseDiffEditor(true);
+    assert.strictEqual(sm.useDiffEditor, true);
   });
 
   test('showInlineDecorations setting persists and defaults to true', async () => {
@@ -68,6 +69,122 @@ suite('hunkwise diff editor integration', function () {
 
     sm.setShowInlineDecorations(true);
     assert.strictEqual(sm.showInlineDecorations, true);
+  });
+
+  test('openDiffEditor switches native diff editor to inline mode', async () => {
+    const filePath = await setupReviewingFile(
+      'native-inline-diff.txt',
+      'line 1\nline 2\n',
+      'line 1\nchanged line 2\n'
+    );
+    const uri = vscode.Uri.file(filePath);
+    const config = vscode.workspace.getConfiguration('diffEditor', uri);
+    const inspected = config.inspect<boolean>('renderSideBySide');
+
+    await config.update('renderSideBySide', true, vscode.ConfigurationTarget.Workspace);
+    try {
+      const panel = getReviewPanel();
+      assert.ok(panel, 'ReviewPanel should be available');
+      await (panel as any).openDiffEditor(filePath);
+      await sleep(500);
+
+      assert.strictEqual(
+        vscode.workspace.getConfiguration('diffEditor', uri).get('renderSideBySide'),
+        false,
+        'Hunkwise diff editor should switch VS Code native diff to inline mode'
+      );
+    } finally {
+      await config.update('renderSideBySide', inspected?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
+  test('openDiffEditor fully expands native inline diff', async () => {
+    const filePath = await setupReviewingFile(
+      'native-inline-expanded.txt',
+      [
+        'top\n',
+        ...Array.from({ length: 40 }, (_, i) => `unchanged ${i}\n`),
+        'old middle\n',
+        ...Array.from({ length: 40 }, (_, i) => `tail ${i}\n`),
+      ].join(''),
+      [
+        'top\n',
+        ...Array.from({ length: 40 }, (_, i) => `unchanged ${i}\n`),
+        'new middle\n',
+        ...Array.from({ length: 40 }, (_, i) => `tail ${i}\n`),
+      ].join('')
+    );
+    const uri = vscode.Uri.file(filePath);
+    const config = vscode.workspace.getConfiguration('diffEditor', uri);
+    const sideBySide = config.inspect<boolean>('renderSideBySide');
+    const hideUnchanged = config.inspect<boolean>('hideUnchangedRegions.enabled');
+
+    await config.update('renderSideBySide', true, vscode.ConfigurationTarget.Workspace);
+    await config.update('hideUnchangedRegions.enabled', true, vscode.ConfigurationTarget.Workspace);
+    try {
+      const panel = getReviewPanel();
+      assert.ok(panel, 'ReviewPanel should be available');
+      await (panel as any).openDiffEditor(filePath);
+      await sleep(500);
+
+      const nextConfig = vscode.workspace.getConfiguration('diffEditor', uri);
+      assert.strictEqual(nextConfig.get('renderSideBySide'), false);
+      assert.strictEqual(
+        nextConfig.get('hideUnchangedRegions.enabled'),
+        false,
+        'Hunkwise native inline diff should show all unchanged regions by default'
+      );
+    } finally {
+      await config.update('renderSideBySide', sideBySide?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await config.update('hideUnchangedRegions.enabled', hideUnchanged?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
+  test('openDiffEditor enables native diff CodeLens controls', async () => {
+    const filePath = await setupReviewingFile(
+      'native-diff-codelens.txt',
+      'line 1\nline 2\n',
+      'line 1\nchanged line 2\n'
+    );
+    const uri = vscode.Uri.file(filePath);
+    const config = vscode.workspace.getConfiguration('diffEditor', uri);
+    const codeLens = config.inspect<boolean>('codeLens');
+    const sideBySide = config.inspect<boolean>('renderSideBySide');
+    const sm = getStateManager();
+    const previousShowInlineDecorations = sm.showInlineDecorations;
+
+    sm.setShowInlineDecorations(false);
+    await config.update('codeLens', false, vscode.ConfigurationTarget.Workspace);
+    await config.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace);
+    try {
+      const panel = getReviewPanel();
+      assert.ok(panel, 'ReviewPanel should be available');
+      await (panel as any).openDiffEditor(filePath);
+      await sleep(500);
+
+      assert.strictEqual(
+        vscode.workspace.getConfiguration('diffEditor', uri).get('codeLens'),
+        true,
+        'Hunkwise native diff should enable VS Code diff editor CodeLens controls'
+      );
+
+      const codeLenses = await vscode.commands.executeCommand<vscode.CodeLens[]>(
+        'vscode.executeCodeLensProvider', uri
+      );
+      const hunkwiseLenses = (codeLenses ?? []).filter(
+        l => l.command?.command === 'hunkwise.codeLensAcceptHunk'
+          || l.command?.command === 'hunkwise.codeLensDiscardHunk'
+          || l.command?.command === 'hunkwise.previousHunk'
+          || l.command?.command === 'hunkwise.nextHunk'
+          || l.command?.command === 'hunkwise.noop'
+      );
+      assert.strictEqual(hunkwiseLenses.length, 5, 'Native diff should expose navigation count and Accept/Discard CodeLens controls');
+      assert.ok(hunkwiseLenses.some(l => l.command?.title === 'Hunk 1/1'), 'Native diff CodeLens should show current/total count');
+    } finally {
+      sm.setShowInlineDecorations(previousShowInlineDecorations);
+      await config.update('codeLens', codeLens?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await config.update('renderSideBySide', sideBySide?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+    }
   });
 
   // ── textDocuments scheme filtering ────────────────────────────────────────
@@ -142,7 +259,7 @@ suite('hunkwise diff editor integration', function () {
     const hunks = computeHunks(fileState.baseline, 'modified\n');
     assert.strictEqual(hunks.length, 1);
 
-    // Accept via the extension's wired callback (simulating CodeLens/inset)
+    // Accept via the extension's wired callback (simulating CodeLens)
     const ext = vscode.extensions.getExtension('molon.hunkwise');
     assert.ok(ext?.isActive);
 
@@ -158,16 +275,50 @@ suite('hunkwise diff editor integration', function () {
     assert.ok(!hasDiffTab(), 'Diff tab should be closed after last hunk accepted');
   });
 
+  test('panel acceptAll closes stale hunkwise diff tab', async () => {
+    const filePath = await setupReviewingFile(
+      'panel-accept-all-close.txt',
+      'before\n',
+      'after\n'
+    );
+
+    const panel = getReviewPanel();
+    assert.ok(panel, 'ReviewPanel should be available');
+    await (panel as any).openDiffEditor(filePath);
+    await sleep(500);
+
+    const hasDiffTab = () => {
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (tab.input instanceof vscode.TabInputTextDiff
+            && tab.input.original.scheme === 'hunkwise-baseline'
+            && tab.input.modified.fsPath === filePath) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    assert.ok(hasDiffTab(), 'Diff tab should exist before panel acceptAll');
+
+    await (panel as any).handleMessage({ command: 'acceptAll' });
+    await sleep(1000);
+
+    assert.ok(!getStateManager().getFile(filePath), 'File should exit reviewing after panel acceptAll');
+    assert.ok(!hasDiffTab(), 'Diff tab should close after panel acceptAll');
+  });
+
   // ── CodeLens visibility ────────────────────────────────────────────────────
 
-  test('CodeLens only appears when hunkwise diff tab is active', async () => {
+  test('CodeLens appears in normal editor as stable action surface', async () => {
     const filePath = await setupReviewingFile(
       'codelens-test.txt',
       'line 1\n',
       'changed line 1\n'
     );
 
-    // Open normal editor first — no CodeLens expected
+    // Open normal editor — Accept/Discard CodeLens should be present as the
+    // stable fallback action surface.
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
     await vscode.window.showTextDocument(doc);
     await sleep(300);
@@ -180,7 +331,11 @@ suite('hunkwise diff editor integration', function () {
     const hunkwiseLenses = (codeLenses ?? []).filter(
       l => l.command?.command === 'hunkwise.codeLensAcceptHunk'
         || l.command?.command === 'hunkwise.codeLensDiscardHunk'
+        || l.command?.command === 'hunkwise.previousHunk'
+        || l.command?.command === 'hunkwise.nextHunk'
+        || l.command?.command === 'hunkwise.noop'
     );
-    assert.strictEqual(hunkwiseLenses.length, 0, 'No hunkwise CodeLens in normal editor');
+    assert.strictEqual(hunkwiseLenses.length, 5, 'Navigation count and Accept/Discard CodeLens should be visible in normal editor');
+    assert.ok(hunkwiseLenses.some(l => l.command?.title === 'Hunk 1/1'), 'Hunk count CodeLens should show current/total');
   });
 });

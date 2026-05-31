@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Install hunkwise
 
-hunkwise is a VSCode extension that uses a proposed (private) API — `editorInsets` — so it cannot be installed from the marketplace and requires a special setup.
+hunkwise is a VSCode extension that uses VSCode's native inline diff editor and CodeLens. It does not require proposed API setup.
 
 ## Prerequisites
 
@@ -21,20 +21,20 @@ hunkwise is a VSCode extension that uses a proposed (private) API — `editorIns
 Clone into a uniquely named temp directory to avoid conflicts:
 
 ```bash
-HUNKWISE_TMP=$(mktemp -d /tmp/hunkwise-XXXXXX)
-git clone https://github.com/molon/hunkwise.git "$HUNKWISE_TMP"
+HUNKWISE_TMP=$(mktemp -d /tmp/native-hunkwise-XXXXXX)
+git clone https://github.com/Rhys-Wang-wannaLearnMath/native-hunkwise.git "$HUNKWISE_TMP"
 cd "$HUNKWISE_TMP"
 ```
 
 On Windows, use a timestamp-based name:
 
 ```bat
-set HUNKWISE_TMP=%TEMP%\hunkwise-%DATE:~-4%%DATE:~3,2%%DATE:~0,2%-%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%
-git clone https://github.com/molon/hunkwise.git %HUNKWISE_TMP%
+set HUNKWISE_TMP=%TEMP%\native-hunkwise-%DATE:~-4%%DATE:~3,2%%DATE:~0,2%-%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%
+git clone https://github.com/Rhys-Wang-wannaLearnMath/native-hunkwise.git %HUNKWISE_TMP%
 cd %HUNKWISE_TMP%
 ```
 
-Remember the directory path — you'll need it for cleanup in Step 6.
+Remember the directory path — you'll need it for cleanup in Step 5.
 
 ### Step 2: Install dependencies and compile
 
@@ -52,14 +52,6 @@ npx @vscode/vsce package --allow-missing-repository
 ```
 
 This produces `hunkwise-<version>.vsix` in the project root. Do NOT use `--no-dependencies` — runtime dependencies (`ignore`, `diff`) must be bundled.
-
-### Step 3.5: Linux stable compatibility check
-
-**Before proceeding on Linux**, check whether the target is a VS Code **stable** build (not Insiders). On some Linux distributions (e.g. CachyOS), the proposed `editorInsets` API may not work in the stable build. If the user is on Linux and only has VS Code stable installed, warn them:
-
-> ⚠️ hunkwise may not work on VS Code stable on some Linux distributions. If it fails to activate, please switch to [VS Code Insiders](https://code.visualstudio.com/insiders/). See [issue #20](https://github.com/molon/hunkwise/issues/20) for details.
-
-Continue with installation — but surface this warning so the user is aware before restarting.
 
 ### Step 4: Detect installed VSCode builds and install the .vsix
 
@@ -100,30 +92,7 @@ if exist "%STABLE%" "%STABLE%" --install-extension %VSIX% --force
 if exist "%INSIDERS%" "%INSIDERS%" --install-extension %VSIX% --force
 ```
 
-### Step 5: Configure proposed API (one-time setup per build)
-
-Because hunkwise uses a proposed API, each installed VSCode build must be told to enable it via its own `argv.json` in the **user config directory**. Apply to every build detected in Step 4 — skip any build where `"molon.hunkwise"` is already present.
-
-**`argv.json` locations (same builds as Step 4):**
-
-| Platform | Build | Path |
-|----------|-------|------|
-| macOS/Linux | Stable | `~/.vscode/argv.json` |
-| macOS/Linux | Insiders | `~/.vscode-insiders/argv.json` |
-| Windows | Stable | `%USERPROFILE%\.vscode\argv.json` |
-| Windows | Insiders | `%USERPROFILE%\.vscode-insiders\argv.json` |
-
-For each relevant `argv.json`: read the existing file, then add or merge `"enable-proposed-api"` — do not overwrite other fields:
-
-```json
-{
-  "enable-proposed-api": ["molon.hunkwise"]
-}
-```
-
-If the key already exists with other values, append `"molon.hunkwise"` rather than replacing the array.
-
-### Step 6: Clean up
+### Step 5: Clean up
 
 Delete the cloned directory:
 
@@ -133,13 +102,13 @@ rm -rf "$HUNKWISE_TMP"
 
 On Windows: `rmdir /s /q %HUNKWISE_TMP%`
 
-### Step 7: Restart VSCode
+### Step 6: Restart VSCode
 
-Tell the user to **fully quit and reopen VSCode** (not just close the window) for the extension and proposed API setting to take effect.
+Tell the user to **fully quit and reopen VSCode** (not just close the window) for the extension update to take effect.
 
 ## Notes
 
-- The `enabledApiProposals: ["editorInsets"]` field in `package.json` enables `vscode.window.createWebviewTextEditorInset`, used to embed per-hunk Accept/Discard buttons inline in the editor. Without this, the buttons will not appear.
+- hunkwise does not require `enable-proposed-api` in `argv.json`.
 - Settings are stored in `.vscode/hunkwise/settings.json` within the workspace, not in VSCode global settings.
 - If the extension fails to activate, check the exthost log:
   - macOS: `~/Library/Application Support/Code[-Insiders]/logs/<timestamp>/window1/exthost/exthost.log`

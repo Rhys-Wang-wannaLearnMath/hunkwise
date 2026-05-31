@@ -3,18 +3,15 @@
   "publisher": "molon",
   "displayName": "hunkwise",
   "description": "Per-hunk Accept/Discard for any file change",
-  "version": "0.0.29",
+  "version": "0.0.40",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Rhys-Wang-wannaLearnMath/hunkwise"
+    "url": "https://github.com/Rhys-Wang-wannaLearnMath/native-hunkwise"
   },
   "engines": {
     "vscode": "^1.90.0"
   },
-  "enabledApiProposals": [
-    "editorInsets"
-  ],
   "icon": "media/icon.png",
   "categories": [
     "Other"
@@ -82,7 +79,7 @@
       "panel": [
         {
           "id": "hunkwisePanel",
-          "title": "hunkwise",
+          "title": "",
           "icon": "media/icon.svg"
         }
       ]

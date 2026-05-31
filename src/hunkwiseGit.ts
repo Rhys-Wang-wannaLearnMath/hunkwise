@@ -7,6 +7,7 @@ import { normalizePath } from './pathNormalize';
 const execFileAsync = promisify(execFile);
 
 export interface Settings {
+  settingsVersion?: number;
   ignorePatterns: string[];
   respectGitignore: boolean;
   clearOnBranchSwitch: boolean;
@@ -17,12 +18,13 @@ export interface Settings {
 }
 
 const DEFAULT_SETTINGS: Settings = {
+  settingsVersion: 2,
   ignorePatterns: process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'],
   respectGitignore: true,
   clearOnBranchSwitch: false,
   autoEnable: false,
   quoteRotationInterval: 30,
-  useDiffEditor: false,
+  useDiffEditor: true,
   showInlineDecorations: true,
 };
 
@@ -88,7 +90,9 @@ export class HunkwiseGit {
     try {
       const raw = fs.readFileSync(this.settingsPath, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<Settings>;
+      const legacyInlineDiffDefault = parsed.settingsVersion === undefined && parsed.useDiffEditor === false;
       return {
+        settingsVersion: DEFAULT_SETTINGS.settingsVersion,
         ignorePatterns: parsed.ignorePatterns ?? [...DEFAULT_SETTINGS.ignorePatterns],
         respectGitignore: parsed.respectGitignore ?? DEFAULT_SETTINGS.respectGitignore,
         clearOnBranchSwitch: parsed.clearOnBranchSwitch ?? DEFAULT_SETTINGS.clearOnBranchSwitch,
@@ -96,9 +100,11 @@ export class HunkwiseGit {
         quoteRotationInterval: (typeof parsed.quoteRotationInterval === 'number' && Number.isFinite(parsed.quoteRotationInterval) && parsed.quoteRotationInterval >= 0)
           ? parsed.quoteRotationInterval
           : DEFAULT_SETTINGS.quoteRotationInterval,
-        useDiffEditor: typeof parsed.useDiffEditor === 'boolean'
-          ? parsed.useDiffEditor
-          : DEFAULT_SETTINGS.useDiffEditor,
+        useDiffEditor: legacyInlineDiffDefault
+          ? DEFAULT_SETTINGS.useDiffEditor
+          : (typeof parsed.useDiffEditor === 'boolean'
+            ? parsed.useDiffEditor
+            : DEFAULT_SETTINGS.useDiffEditor),
         showInlineDecorations: typeof parsed.showInlineDecorations === 'boolean'
           ? parsed.showInlineDecorations
           : DEFAULT_SETTINGS.showInlineDecorations,

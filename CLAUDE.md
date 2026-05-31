@@ -20,11 +20,11 @@ Unit tests use Node's built-in `node:test` runner. Integration tests use `@vscod
 
 ## Architecture
 
-hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls for any external file change (AI tools, scripts, etc.). It requires the proposed `editorInsets` API and cannot be installed from the marketplace.
+hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls for file changes from AI tools, scripts, VSCode extensions, and manual edits. It uses VSCode's native inline diff editor plus CodeLens and does not require proposed APIs.
 
 ### Core data flow
 
-1. **`FileWatcher`** monitors all workspace file changes via VSCode's `FileSystemWatcher` and `onDidChangeTextDocument`. It distinguishes user edits (ignored) from external tool writes (triggers review) by checking if the open document buffer matches the disk content.
+1. **`FileWatcher`** monitors workspace file changes via VSCode's `FileSystemWatcher` and `onDidChangeTextDocument`. Tracked content changes enter review mode unless they are explicitly marked as self-edits by hunkwise review commands.
 
 2. **`StateManager`** holds in-memory `Map<filePath, FileState>` where `FileState = { status: 'reviewing' | 'idle', baseline: string }`. All mutations are synchronously reflected in memory and asynchronously queued to git via a serial `gitQueue` promise chain.
 
@@ -32,14 +32,13 @@ hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls fo
 
 4. **`DiffEngine`** (`diffEngine.ts`) computes hunks by calling `Diff.diffLines(baseline, current)` from the `diff` npm package. Hunk IDs are stable strings derived from position (`newStart:newLines:oldStart:oldLines`).
 
-5. **`DecorationManager`** renders the diff UI using the proposed `editorInsets` API (`vscode.window.createWebviewTextEditorInset`). For each hunk it creates:
-   - A red "deleted lines" inset (HTML webview) above the green block
+5. **`DecorationManager`** provides lightweight normal-editor fallback visuals:
    - A green line decoration on added lines
-   - An "Accept / Discard" action bar inset below the green block
+   - No deleted-line webview insets; native inline diff handles red/green diff rendering
 
-   Insets are reused across refreshes by cache key (`afterLine:height`) to avoid flicker.
+   Per-hunk controls are provided by **`DiffCodeLensProvider`** in native inline diff tabs and normal editors.
 
-6. **`ReviewPanel`** (`reviewPanel.ts`) is the sidebar webview panel showing all pending files with batch actions. It communicates with the extension via `vscode.postMessage`.
+6. **`ReviewPanel`** (`reviewPanel.ts`) is the sidebar webview panel showing all pending files with batch actions. Panel file/hunk clicks open VSCode native inline diff by default. It communicates with the extension via `vscode.postMessage`.
 
 ### Key behaviors
 
@@ -59,4 +58,4 @@ hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls fo
 
 ### Integration tests
 
-`tsconfig.integration.json` compiles to `out-integration/`. Tests run in a real VSCode instance via `.vscode-test.mjs` config with `--enable-proposed-api=molon.hunkwise`. Test workspace is at `src/test/integration/workspace/`. Each test `setup()` cleans the workspace and `teardown()` disables hunkwise.
+`tsconfig.integration.json` compiles to `out-integration/`. Tests run in a real VSCode instance via `.vscode-test.mjs`. Test workspace is at `src/test/integration/workspace/`. Each test `setup()` cleans the workspace and `teardown()` disables hunkwise.

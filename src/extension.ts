@@ -206,15 +206,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     }
   }
 
-  decorationManager = new DecorationManager(stateManager, (command, filePath, hId) => {
-    if (command === 'accept') {
-      acceptHunk(stateManager, filePath, hId, () => { onStateChanged(); fireBaselineChange(filePath); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }, 'inset');
-    } else if (command === 'discard') {
-      discardHunk(stateManager, fileWatcher, filePath, hId, () => { onStateChanged(); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }, 'inset');
-    } else {
-      navigateHunk(command, filePath, hId);
-    }
-  });
+  decorationManager = new DecorationManager(stateManager);
 
   context.subscriptions.push(
     vscode.window.onDidChangeVisibleTextEditors(editors => {
@@ -225,6 +217,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
       if (editor) decorationManager?.refresh([editor]);
       diffCodeLensProvider?.fire();
       updateUndoContext();
+    }),
+    vscode.window.tabGroups.onDidChangeTabs(() => {
+      diffCodeLensProvider?.fire();
+    }),
+    vscode.window.tabGroups.onDidChangeTabGroups(() => {
+      diffCodeLensProvider?.fire();
     }),
     vscode.workspace.onDidChangeTextDocument(e => {
       if (e.document.uri.scheme !== 'file') return;
@@ -239,7 +237,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     }),
   );
 
-  reviewPanel = new ReviewPanel(context, stateManager, fileWatcher, onStateChanged, fireBaselineChange, closeStaleTabs);
+  reviewPanel = new ReviewPanel(
+    context,
+    stateManager,
+    fileWatcher,
+    onStateChanged,
+    fireBaselineChange,
+    closeStaleTabs,
+    () => diffCodeLensProvider?.fire()
+  );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('hunkwiseToolbar', reviewPanel)
   );
@@ -263,6 +269,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     vscode.commands.registerCommand('hunkwise.nextHunk', (filePath?: string, hId?: string) => {
       navigateHunk('next', filePath, hId);
     }),
+    vscode.commands.registerCommand('hunkwise.noop', () => {}),
     vscode.commands.registerCommand('hunkwise.undoReviewAction', async () => {
       const filePath = activeFilePath();
       const result = filePath ? stateManager.undoLastReviewAction(filePath) : stateManager.undoLastReviewAction();

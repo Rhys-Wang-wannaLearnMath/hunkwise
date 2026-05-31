@@ -302,17 +302,6 @@ export class FileWatcher {
       return;
     }
 
-    // Check if this was a manual create in VSCode (editor buffer matches disk)
-    const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
-    const bufferMatch = openDoc ? openDoc.getText() === diskRead.content : false;
-    log(`onDiskCreate(${basename}): openDoc=${!!openDoc}, bufferMatch=${bufferMatch}`);
-    if (openDoc && bufferMatch) {
-      // User created/saved this file in VSCode — snapshot as baseline, no hunk
-      log(`onDiskCreate(${basename}): buffer matches disk, snapshot as baseline`);
-      this.stateManager.snapshotFile(filePath, diskRead.content);
-      return;
-    }
-
     // External tool created this file — show as new file hunk (null = file didn't exist before)
     log(`onDiskCreate(${basename}): external create, enterReviewing as NEW`);
     this.enterReviewing(filePath, null, diskRead.content);
@@ -436,16 +425,9 @@ export class FileWatcher {
     const git = this.stateManager.git;
     if (!git) return;
 
-    // Check if this was a manual save in VSCode (editor buffer matches disk)
-    const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
-    if (diskRead.ok && openDoc && openDoc.getText() === diskRead.content) {
-      // User saved in VSCode — accept into baseline, no hunk
-      this.stateManager.snapshotFile(filePath, diskRead.content);
-      return;
-    }
-
     // External change — compare against hunkwise baseline
-    const gitBaseline = await git.getBaseline(filePath);
+    const pendingBaseline = this.stateManager.getPendingBaselineSnapshot(filePath);
+    const gitBaseline = pendingBaseline !== undefined ? pendingBaseline : await git.getBaseline(filePath);
     if (!diskRead.ok) {
       if (gitBaseline !== undefined) {
         this.markReviewingUnavailable(filePath, gitBaseline, diskRead);
@@ -453,15 +435,10 @@ export class FileWatcher {
       return;
     }
     if (gitBaseline === undefined) {
-      // No baseline in git — silently adopt current content as baseline rather than
-      // treating as a new file. This avoids false "new file" hunks in cases like:
-      // - ignore rules just changed (file newly un-ignored, not actually new)
-      // - syncIgnoreState hasn't finished its git queue yet
-      // - first enable where snapshotWorkspace is still in progress
-      // Genuine new files created while hunkwise is running are caught by onDidCreate,
-      // not this path. This is intentionally consistent with syncIgnoreState's toAdd
-      // behavior which also silently snapshots.
-      this.stateManager.snapshotFile(filePath, diskRead.content);
+      // No baseline in git. Treat this as a reviewable new file rather than
+      // silently adopting it; FileSystemWatcher can miss or reorder create/change
+      // events, and silent adoption makes real tool edits look auto-accepted.
+      this.enterReviewing(filePath, null, diskRead.content);
       return;
     }
     this.enterReviewing(filePath, gitBaseline, diskRead.content);

@@ -65,7 +65,8 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
     private fileWatcher: FileWatcher,
     private onStateChanged: () => void,
     private onBaselineChanged?: (filePath: string) => void,
-    private onAfterHunkAction?: () => Promise<void>
+    private onAfterHunkAction?: () => Promise<void>,
+    private onDiffEditorOpened?: () => void
   ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -247,9 +248,11 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
       }
       case 'acceptAll':
         await acceptAllFiles(this.stateManager, this.onStateChanged);
+        await this.onAfterHunkAction?.();
         break;
       case 'discardAll':
         await discardAllFiles(this.stateManager, this.fileWatcher, this.onStateChanged);
+        await this.onAfterHunkAction?.();
         break;
       case 'acceptFile':
         if (msg.filePath) {
@@ -321,7 +324,7 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
           const fileName = path.basename(msg.filePath);
           const baselineUri = vscode.Uri.file(msg.filePath).with({ scheme: 'hunkwise-baseline' });
           const emptyUri = vscode.Uri.from({ scheme: 'untitled', path: msg.filePath + '.deleted' });
-          await vscode.commands.executeCommand('vscode.diff', baselineUri, emptyUri, `${fileName} (deleted)`);
+          await this.openNativeInlineDiff(baselineUri, emptyUri, `${fileName} (deleted)`);
         }
         break;
       case 'jumpToHunk':
@@ -354,7 +357,7 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
     const baselineUri = vscode.Uri.file(filePath).with({ scheme: 'hunkwise-baseline' });
     const currentUri = vscode.Uri.file(filePath);
 
-    await vscode.commands.executeCommand('vscode.diff', baselineUri, currentUri, `${fileName} (hunkwise)`);
+    await this.openNativeInlineDiff(baselineUri, currentUri, `${fileName} (hunkwise)`);
 
     // Jump to the target hunk position in the diff editor's modified side.
     // Prefer the embedded editor (viewColumn undefined) over a normal editor for the same file.
@@ -376,6 +379,58 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
         editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
       }
     }
+  }
+
+  private async openNativeInlineDiff(
+    originalUri: vscode.Uri,
+    modifiedUri: vscode.Uri,
+    title: string
+  ): Promise<void> {
+    const diffConfig = vscode.workspace.getConfiguration('diffEditor', modifiedUri);
+    const codeLens = diffConfig.get<boolean>('codeLens', true);
+    if (!codeLens) {
+      try {
+        await diffConfig.update('codeLens', true, vscode.ConfigurationTarget.Workspace);
+        log(`openNativeInlineDiff(${path.basename(modifiedUri.fsPath || title)}): enabled diff editor CodeLens`);
+      } catch (err) {
+        log(`openNativeInlineDiff: failed to enable diff editor CodeLens: ${err}`);
+      }
+    }
+
+    await vscode.commands.executeCommand('vscode.diff', originalUri, modifiedUri, title);
+
+    const renderSideBySide = vscode.workspace
+      .getConfiguration('diffEditor', modifiedUri)
+      .get<boolean>('renderSideBySide', true);
+    if (renderSideBySide) {
+      try {
+        await vscode.commands.executeCommand('toggle.diff.renderSideBySide', modifiedUri);
+        log(`openNativeInlineDiff(${path.basename(modifiedUri.fsPath || title)}): switched to inline diff`);
+      } catch (err) {
+        log(`openNativeInlineDiff: failed to switch to inline diff: ${err}`);
+      }
+    }
+
+    const hideUnchangedRegions = vscode.workspace
+      .getConfiguration('diffEditor', modifiedUri)
+      .get<boolean>('hideUnchangedRegions.enabled', false);
+    if (hideUnchangedRegions) {
+      try {
+        await vscode.workspace
+          .getConfiguration('diffEditor', modifiedUri)
+          .update('hideUnchangedRegions.enabled', false, vscode.ConfigurationTarget.Workspace);
+      } catch (err) {
+        log(`openNativeInlineDiff: failed to disable hidden unchanged regions: ${err}`);
+      }
+    }
+
+    try {
+      await vscode.commands.executeCommand('diffEditor.showAllUnchangedRegions');
+    } catch (err) {
+      log(`openNativeInlineDiff: failed to expand unchanged regions: ${err}`);
+    }
+
+    this.onDiffEditorOpened?.();
   }
 
   private getHtml(webview: vscode.Webview): string {

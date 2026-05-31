@@ -350,17 +350,35 @@ describe('HunkwiseGit', () => {
       const expectedDefaults = process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'];
       assert.deepEqual(s.ignorePatterns, expectedDefaults);
       assert.equal(s.respectGitignore, true);
+      assert.equal(s.useDiffEditor, true);
       fs.rmSync(dir2, { recursive: true, force: true });
     });
 
     it('round-trips settings', () => {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-settings2-'));
       const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
-      g2.saveSettings({ ignorePatterns: ['node_modules', 'dist'], respectGitignore: false, clearOnBranchSwitch: false, quoteRotationInterval: 60, useDiffEditor: false, showInlineDecorations: true, autoEnable: false });
+      g2.saveSettings({ settingsVersion: 2, ignorePatterns: ['node_modules', 'dist'], respectGitignore: false, clearOnBranchSwitch: false, quoteRotationInterval: 60, useDiffEditor: false, showInlineDecorations: true, autoEnable: false });
       const s = g2.loadSettings();
       assert.deepEqual(s.ignorePatterns, ['node_modules', 'dist']);
       assert.equal(s.respectGitignore, false);
       assert.equal(s.quoteRotationInterval, 60);
+      assert.equal(s.useDiffEditor, false);
+      fs.rmSync(dir2, { recursive: true, force: true });
+    });
+
+    it('migrates legacy useDiffEditor=false to native inline diff default', () => {
+      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-settings-legacy-inline-'));
+      const settingsDir = path.join(dir2, '.vscode', 'hunkwise');
+      fs.mkdirSync(settingsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(settingsDir, 'settings.json'),
+        JSON.stringify({ ignorePatterns: ['.git'], respectGitignore: true, clearOnBranchSwitch: false, quoteRotationInterval: 30, useDiffEditor: false, showInlineDecorations: true, autoEnable: false }),
+        'utf-8'
+      );
+      const g2 = new HunkwiseGit(settingsDir, dir2);
+      const s = g2.loadSettings();
+      assert.equal(s.useDiffEditor, true);
+      assert.equal(s.settingsVersion, 2);
       fs.rmSync(dir2, { recursive: true, force: true });
     });
 

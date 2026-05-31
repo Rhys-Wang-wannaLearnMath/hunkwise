@@ -6,7 +6,9 @@ import {
   getWorkspaceRoot, gitListTracked, gitGetBaseline,
   sleep, waitForCondition, enableHunkwise, disableHunkwise,
   writeFileExternally, cleanWorkspace, getStateManager,
+  getFileWatcher,
 } from './helpers';
+import { acceptFileByPath } from '../../commands';
 
 // ── Test suite ────────────────────────────────────────────────────────────────
 
@@ -18,6 +20,7 @@ suite('hunkwise file watcher integration', function () {
   });
 
   teardown(async function () {
+    await vscode.commands.executeCommand('workbench.action.closeAllEditors');
     try { await disableHunkwise(); } catch { /* ignore */ }
     cleanWorkspace();
   });
@@ -44,6 +47,9 @@ suite('hunkwise file watcher integration', function () {
     // Baselines should match file contents
     assert.strictEqual(gitGetBaseline(root, relA), 'content a\n');
     assert.strictEqual(gitGetBaseline(root, relB), 'content b\n');
+    const sm = getStateManager();
+    assert.ok(!sm.getFile(fileA), 'Existing files snapshotted during enable should not enter review');
+    assert.ok(!sm.getFile(fileB), 'Existing nested files snapshotted during enable should not enter review');
   });
 
   test('disable clears all state and removes git directory', async () => {
@@ -109,6 +115,97 @@ suite('hunkwise file watcher integration', function () {
     // Baseline should remain the original content
     const baselineAfter = gitGetBaseline(root, rel);
     assert.strictEqual(baselineAfter, 'original\n', 'Baseline should be preserved after external modification');
+  });
+
+  test('external modification after accept re-enters reviewing for an open file', async () => {
+    const root = getWorkspaceRoot();
+    const filePath = path.join(root, 'second-round-open.txt');
+    const rel = path.relative(root, filePath);
+
+    writeFileExternally(filePath, 'original\n');
+    await enableHunkwise();
+    await waitForCondition(() => gitGetBaseline(root, rel) === 'original\n', 5000);
+
+    writeFileExternally(filePath, 'first round\n');
+
+    const sm = getStateManager();
+    assert.ok(sm, 'StateManager should be available');
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 8000);
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+    await vscode.window.showTextDocument(doc);
+    acceptFileByPath(sm, filePath, () => {});
+    await waitForCondition(() => !sm.getFile(filePath), 5000);
+    await waitForCondition(() => gitGetBaseline(root, rel) === 'first round\n', 5000);
+
+    writeFileExternally(filePath, 'second round\n');
+    await waitForCondition(() => doc.getText() === 'second round\n', 8000);
+
+    const fw = getFileWatcher();
+    assert.ok(fw, 'FileWatcher should be available');
+    await (fw as any).onDiskChange(vscode.Uri.file(filePath));
+
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 5000);
+    assert.strictEqual(sm.getFile(filePath)?.baseline, 'first round\n');
+  });
+
+  test('saved VSCode document edit after accept re-enters reviewing', async () => {
+    const root = getWorkspaceRoot();
+    const filePath = path.join(root, 'second-round-save.txt');
+    const rel = path.relative(root, filePath);
+    const uri = vscode.Uri.file(filePath);
+
+    writeFileExternally(filePath, 'original\n');
+    await enableHunkwise();
+    await waitForCondition(() => gitGetBaseline(root, rel) === 'original\n', 5000);
+
+    writeFileExternally(filePath, 'first round\n');
+
+    const sm = getStateManager();
+    assert.ok(sm, 'StateManager should be available');
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 8000);
+
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc);
+    acceptFileByPath(sm, filePath, () => {});
+    await waitForCondition(() => !sm.getFile(filePath), 5000);
+    await waitForCondition(() => gitGetBaseline(root, rel) === 'first round\n', 5000);
+
+    const edit = new vscode.WorkspaceEdit();
+    const fullRange = new vscode.Range(
+      new vscode.Position(0, 0),
+      new vscode.Position(doc.lineCount - 1, doc.lineAt(doc.lineCount - 1).text.length)
+    );
+    edit.replace(uri, fullRange, 'second round\n');
+    assert.ok(await vscode.workspace.applyEdit(edit), 'WorkspaceEdit should apply');
+    await doc.save();
+
+    const fw = getFileWatcher();
+    assert.ok(fw, 'FileWatcher should be available');
+    await (fw as any).onDiskChange(uri);
+
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 5000);
+    assert.strictEqual(sm.getFile(filePath)?.baseline, 'first round\n');
+  });
+
+  test('change event without git baseline enters reviewing instead of auto-accepting', async () => {
+    const root = getWorkspaceRoot();
+    await enableHunkwise();
+
+    const filePath = path.join(root, 'change-without-baseline.txt');
+    const rel = path.relative(root, filePath);
+    writeFileExternally(filePath, 'created before watcher saw create\n');
+
+    const sm = getStateManager();
+    const fw = getFileWatcher();
+    assert.ok(sm, 'StateManager should be available');
+    assert.ok(fw, 'FileWatcher should be available');
+
+    await (fw as any).onDiskChange(vscode.Uri.file(filePath));
+
+    await waitForCondition(() => sm.getFile(filePath)?.status === 'reviewing', 5000);
+    assert.strictEqual(sm.getFile(filePath)?.baseline, null);
+    assert.strictEqual(gitGetBaseline(root, rel), undefined, 'Missing baseline changes must not be auto-accepted');
   });
 
   test('external file deletion of new file (null baseline) cleans up state', async () => {

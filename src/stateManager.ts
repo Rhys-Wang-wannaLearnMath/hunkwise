@@ -42,12 +42,13 @@ export class StateManager {
   private _clearOnBranchSwitch: boolean = false;
   private _autoEnable: boolean = false;
   private _quoteRotationInterval: number = 30;
-  private _useDiffEditor: boolean = false;
+  private _useDiffEditor: boolean = true;
   private _showInlineDecorations: boolean = true;
   private _git: HunkwiseGit | undefined;
 
   // Serial queue: git ops run one at a time; flush() awaits the tail
   private gitQueue: Promise<void> = Promise.resolve();
+  private pendingBaselineSnapshots: Map<string, string> = new Map();
 
   // Optional callback invoked when a git failure causes an in-memory rollback
   // (e.g. exitReviewing snapshot fails and reviewing state is restored).
@@ -408,6 +409,7 @@ export class StateManager {
 
   removeFile(filePath: string): void {
     filePath = normalizePath(filePath);
+    this.pendingBaselineSnapshots.delete(filePath);
     // Clone old state so the rollback has an independent snapshot
     const oldState = this.state.has(filePath) ? { ...this.state.get(filePath)! } : undefined;
     this.state.delete(filePath);
@@ -468,10 +470,26 @@ export class StateManager {
    * Use this instead of calling git.snapshot() directly to avoid concurrent git ops.
    */
   snapshotFile(filePath: string, content: string): void {
+    filePath = normalizePath(filePath);
     if (this._git) {
       const g = this._git;
-      this.gitQueue = this.gitQueue.then(() => g.snapshot(filePath, content)).catch(err => { log(`git queue error: ${err}`); });
+      const baseline = content;
+      this.pendingBaselineSnapshots.set(filePath, baseline);
+      this.gitQueue = this.gitQueue.then(() => g.snapshot(filePath, baseline)).then(() => {
+        if (this.pendingBaselineSnapshots.get(filePath) === baseline) {
+          this.pendingBaselineSnapshots.delete(filePath);
+        }
+      }).catch(err => {
+        if (this.pendingBaselineSnapshots.get(filePath) === baseline) {
+          this.pendingBaselineSnapshots.delete(filePath);
+        }
+        log(`git queue error: ${err}`);
+      });
     }
+  }
+
+  getPendingBaselineSnapshot(filePath: string): string | undefined {
+    return this.pendingBaselineSnapshots.get(normalizePath(filePath));
   }
 
   getAllFiles(): ReadonlyMap<string, FileState> {
@@ -496,7 +514,15 @@ export class StateManager {
       if (this._git) {
         const g = this._git;
         const baseline = newBaseline;
-        this.gitQueue = this.gitQueue.then(() => g.snapshot(filePath, baseline)).catch(err => {
+        this.pendingBaselineSnapshots.set(filePath, baseline);
+        this.gitQueue = this.gitQueue.then(() => g.snapshot(filePath, baseline)).then(() => {
+          if (this.pendingBaselineSnapshots.get(filePath) === baseline) {
+            this.pendingBaselineSnapshots.delete(filePath);
+          }
+        }).catch(err => {
+          if (this.pendingBaselineSnapshots.get(filePath) === baseline) {
+            this.pendingBaselineSnapshots.delete(filePath);
+          }
           log(`git queue error (exitReviewing rollback): ${err}`);
           // Restore reviewing state so the user can retry rather than silently getting a stale baseline
           if (!this.state.has(filePath) && oldState) {
@@ -531,6 +557,7 @@ export class StateManager {
       this._showInlineDecorations = merged.showInlineDecorations;
     } else {
       this.state.clear();
+      this.pendingBaselineSnapshots.clear();
       this._git?.destroyGit();
       this._git = undefined;
     }
@@ -582,7 +609,7 @@ export class StateManager {
   }
 
   private currentSettings() {
-    return { ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, autoEnable: this._autoEnable, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations };
+    return { settingsVersion: 2, ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, autoEnable: this._autoEnable, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations };
   }
 
   setIgnorePatterns(patterns: string[]): void {
@@ -821,10 +848,11 @@ export class StateManager {
     this._ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
     this._respectGitignore = true;
     this._clearOnBranchSwitch = false;
-    this._useDiffEditor = false;
+    this._useDiffEditor = true;
     this._showInlineDecorations = true;
     this._autoEnable = false;
     this.state.clear();
+    this.pendingBaselineSnapshots.clear();
     this._git = undefined;
     this.gitQueue = Promise.resolve();
   }

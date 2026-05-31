@@ -59,9 +59,14 @@ async function enableHunkwise(
     await Promise.all([
       new Promise(resolve => setTimeout(resolve, 750)),
       (async () => {
-        await stateManager.setEnabled(true);
-        try { upsertGitignore(); } catch (err) { log(`upsertGitignore failed: ${err}`); }
-        await stateManager.snapshotWorkspace((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+        fileWatcher.suppressAll();
+        try {
+          await stateManager.setEnabled(true);
+          try { upsertGitignore(); } catch (err) { log(`upsertGitignore failed: ${err}`); }
+          await stateManager.snapshotWorkspace((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+        } finally {
+          fileWatcher.resumeAll();
+        }
       })(),
     ]);
   } finally {
@@ -86,6 +91,7 @@ export async function acceptAllFiles(
   for (const filePath of Array.from(stateManager.getAllFiles().keys())) {
     acceptFileByPath(stateManager, filePath, () => {});
   }
+  await stateManager.flush();
   onStateChanged();
 }
 

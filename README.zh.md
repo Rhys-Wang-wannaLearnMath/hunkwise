@@ -1,4 +1,4 @@
-# hunkwise
+# native-hunkwise
 
 <p align="center">
   <img src="media/icon.png" width="128" alt="hunkwise logo">
@@ -6,19 +6,21 @@
 
 <p align="center"><em>Your future self will thank you. Or blame you. It depends on the diff.</em></p>
 
-在 VSCode 中对任意文件变更进行逐块（hunk）接受/丢弃操作。
+在 VSCode 中基于原生 inline diff 对任意文件变更进行逐块（hunk）接受/丢弃操作。
 
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[OpenCode](https://github.com/anomalyco/opencode) 等 AI 编程工具以 CLI 或插件形式运行，不像 Cursor、Windsurf、Copilot 那样拥有原生 IDE，因此缺少逐块审查变更的内置体验。
 
-**hunkwise** 正是为此而生——将逐块 review 控件直接带入 VSCode，适用于任何外部文件变更。
+**native-hunkwise** 是 hunkwise 的原生 diff 重构版。GitHub 项目已更名为 `native-hunkwise`，但 VSCode 扩展内仍显示为 **hunkwise**，以保持已有命令、设置和安装兼容。
+
+这次重构移除了旧的自定义 webview/editor-inset diff 渲染路径，改为使用 VSCode 原生 inline diff editor 和 CodeLens 来提供 hunk 跳转、Accept、Discard。
 
 ![snapshot](media/snapshot.png)
 
 ## 功能特性
 
 - 追踪来自任何来源的文件变更（AI 工具、脚本、手动编辑）
-- 在编辑器内联显示逐块 `✓ Accept | ↺ Discard` 操作控件
-- 新增行绿色高亮，删除行红色高亮
+- 在编辑器和原生 inline diff 中通过 CodeLens 显示逐块 `Previous | Hunk 1/N | Next | Accept Hunk | Discard Hunk` 操作
+- 原生 inline diff 使用 VSCode 内置的绿色/红色变更渲染
 - 侧边栏面板列出所有待处理文件及块详情，支持批量操作
 - 支持新建文件和已删除文件的追踪与展示
 - 通过内置轻量 git 仓库持久化状态，VSCode 重启后自动恢复
@@ -26,11 +28,11 @@
 
 ## 安装
 
-hunkwise 使用了 [VSCode 提案 API](https://code.visualstudio.com/api/advanced-topics/using-proposed-api)（`editorInsets`），无法从应用商店安装。
+hunkwise 不再依赖 VSCode 提案 API；review 视图基于 VSCode 原生 inline diff editor 和 CodeLens。
 
 直接告诉你的 AI 工具：
 
-> Run this skill: <https://github.com/Rhys-Wang-wannaLearnMath/hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
+> Run this skill: <https://github.com/Rhys-Wang-wannaLearnMath/native-hunkwise/blob/main/skills/install-hunkwise/SKILL.md>
 
 ## 使用方法
 
@@ -44,7 +46,7 @@ hunkwise 使用了 [VSCode 提案 API](https://code.visualstudio.com/api/advance
 
 ### 审查变更
 
-- 在编辑器中点击每个块上方的 `✓` 或 `↺` 按钮
+- 在编辑器或原生 inline diff 中点击每个块上方的 `Accept` 或 `Discard`
 - 在 **hunkwise** 侧边栏面板中可以：
   - 查看所有有待处理变更的文件
   - 对单个块执行接受或丢弃
@@ -79,6 +81,8 @@ hunkwise 使用了 [VSCode 提案 API](https://code.visualstudio.com/api/advance
 | `respectGitignore` | `true` | 是否遵守 `.gitignore` 规则 |
 | `clearOnBranchSwitch` | `false` | 切换 git 分支时自动清除所有待处理的 hunk |
 | `autoEnable` | `false` | 打开项目时自动启用 hunkwise |
+| `useDiffEditor` | `true` | 点击面板文件/hunk 时打开 VSCode 原生 inline diff 编辑器 |
+| `showInlineDecorations` | `true` | 显示普通编辑器中的新增行高亮和 CodeLens 操作 |
 
 ## .gitignore
 
@@ -90,16 +94,11 @@ hunkwise 使用了 [VSCode 提案 API](https://code.visualstudio.com/api/advance
 
 启用 hunkwise 后，它会将工作区所有文件快照到一个位于 `.vscode/hunkwise/git/` 的私有 git 仓库中。该仓库存储**基线** —— 即 hunkwise 开始追踪时每个文件的内容。仓库始终只有一个 commit（每次变更都使用 `--amend`）。
 
-当外部工具修改文件时，hunkwise 会将当前内容与存储的基线进行 diff 以生成 hunk。接受某个 hunk 会更新基线；丢弃某个 hunk 则恢复基线内容。
+当被追踪文件发生变更时，hunkwise 会将当前内容与存储的基线进行 diff 以生成 hunk。接受某个 hunk 会更新基线；丢弃某个 hunk 则恢复基线内容。
 
-### 外部变更 vs 手动编辑检测
+### 变更检测
 
-hunkwise 会区分以下两种情况：
-
-- **外部变更**（AI 工具、脚本）：当磁盘上的文件内容与编辑器缓冲区不一致时被检测到。这会触发审查模式并显示内联 hunk。
-- **手动编辑**（用户在 VSCode 中输入）：保存后编辑器缓冲区与磁盘内容一致。这会静默更新基线 —— 不会产生 hunk。
-
-这意味着你可以在 hunkwise 启用期间自由编辑文件，只有工具生成的变更才会产生 hunk。
+hunkwise 会将脚本、AI 工具、VSCode 扩展以及编辑器保存产生的内容变化都视为可审查变更。这样可以避免漏掉通过 VSCode document API 应用、而不是直接写磁盘的工具生成改动。
 
 ### 文件重命名与删除处理
 

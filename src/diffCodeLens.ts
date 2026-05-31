@@ -6,7 +6,9 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
   private _onDidChangeCodeLenses = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
 
-  constructor(private stateManager: StateManager) {}
+  constructor(
+    private stateManager: StateManager,
+  ) {}
 
   fire(): void {
     this._onDidChangeCodeLenses.fire();
@@ -20,12 +22,11 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
     if (document.uri.scheme !== 'file') return [];
     if (!this.stateManager.enabled) return [];
 
-    // Only show CodeLenses when:
-    // 1. A hunkwise diff tab for this file is the active tab in some group
-    // 2. No normal editor (viewColumn defined) for this file is visible
-    //    (avoids duplicate actions when split-view shows both diff + normal editor)
-    if (!this.isActiveHunkwiseDiffTab(document.uri)) return [];
-    if (this.hasVisibleNormalEditor(document.uri)) return [];
+    // Show CodeLens in hunkwise diff tabs and normal editors. This is the
+    // stable action surface; native diff handles the heavy visual rendering.
+    const inActiveDiffTab = this.isActiveHunkwiseDiffTab(document.uri);
+    const showNormalEditorLenses = !inActiveDiffTab && this.stateManager.showInlineDecorations;
+    if (!inActiveDiffTab && !showNormalEditorLenses) return [];
 
     const fileState = this.stateManager.getFile(document.uri.fsPath);
     if (!fileState || fileState.status !== 'reviewing') return [];
@@ -34,7 +35,8 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
     const hunks = computeHunks(fileState.baseline, document.getText());
     const lenses: vscode.CodeLens[] = [];
 
-    for (const hunk of hunks) {
+    for (let index = 0; index < hunks.length; index++) {
+      const hunk = hunks[index];
       // CodeLens renders above the target line, so place it on the line
       // after the hunk to appear visually below the changed block.
       const afterHunk = hunk.newStart - 1 + hunk.newLines;
@@ -44,12 +46,26 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
 
       lenses.push(
         new vscode.CodeLens(range, {
-          title: '$(check) Accept',
+          title: '$(arrow-up) Previous',
+          command: 'hunkwise.previousHunk',
+          arguments: [document.uri.fsPath, id],
+        }),
+        new vscode.CodeLens(range, {
+          title: `Hunk ${index + 1}/${hunks.length}`,
+          command: 'hunkwise.noop',
+        }),
+        new vscode.CodeLens(range, {
+          title: '$(arrow-down) Next',
+          command: 'hunkwise.nextHunk',
+          arguments: [document.uri.fsPath, id],
+        }),
+        new vscode.CodeLens(range, {
+          title: '$(check) Accept Hunk',
           command: 'hunkwise.codeLensAcceptHunk',
           arguments: [document.uri.fsPath, id],
         }),
         new vscode.CodeLens(range, {
-          title: '$(x) Discard',
+          title: '$(x) Discard Hunk',
           command: 'hunkwise.codeLensDiscardHunk',
           arguments: [document.uri.fsPath, id],
         }),
@@ -57,15 +73,6 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
     }
 
     return lenses;
-  }
-
-  private hasVisibleNormalEditor(uri: vscode.Uri): boolean {
-    const fsPath = uri.fsPath;
-    return vscode.window.visibleTextEditors.some(
-      e => e.document.uri.scheme === 'file'
-        && e.document.uri.fsPath === fsPath
-        && e.viewColumn !== undefined
-    );
   }
 
   private isActiveHunkwiseDiffTab(uri: vscode.Uri): boolean {

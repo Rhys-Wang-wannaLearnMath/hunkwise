@@ -298,13 +298,13 @@ function renderSettingsScreen(state) {
     vscode.postMessage({ command: 'setShowInlineDecorations', value: inlineDecCheckbox.checked });
   });
   inlineDecDescRow.appendChild(inlineDecCheckbox);
-  inlineDecDescRow.appendChild(el('span', 'settings-check-desc', 'Show Accept/Discard buttons and diff highlights inline in the editor'));
+  inlineDecDescRow.appendChild(el('span', 'settings-check-desc', 'Show normal-editor CodeLens actions and added-line highlights'));
   inlineDecRow.appendChild(inlineDecDescRow);
   appearanceSection.appendChild(inlineDecRow);
 
   // Open diff editor from panel
   const diffEditorRow = el('label', 'settings-check-row');
-  diffEditorRow.appendChild(el('span', 'settings-check-label', 'Open diff editor from panel'));
+  diffEditorRow.appendChild(el('span', 'settings-check-label', 'Open native inline diff from panel'));
   const diffEditorDescRow = el('div', 'settings-check-desc-row');
   const diffEditorCheckbox = /** @type {HTMLInputElement} */ (document.createElement('input'));
   diffEditorCheckbox.type = 'checkbox';
@@ -314,7 +314,7 @@ function renderSettingsScreen(state) {
     vscode.postMessage({ command: 'setUseDiffEditor', value: diffEditorCheckbox.checked });
   });
   diffEditorDescRow.appendChild(diffEditorCheckbox);
-  diffEditorDescRow.appendChild(el('span', 'settings-check-desc', 'Clicking files or hunks in the panel opens a diff view (baseline vs current) instead of the inline editor'));
+  diffEditorDescRow.appendChild(el('span', 'settings-check-desc', 'Clicking files or hunks in the panel opens VS Code native inline diff (baseline vs current)'));
   diffEditorRow.appendChild(diffEditorDescRow);
   appearanceSection.appendChild(diffEditorRow);
   appearanceSection.appendChild(rotationRow);
