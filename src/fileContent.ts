@@ -6,6 +6,20 @@ export type TextFileReadResult =
   | { ok: true; content: string; byteLength: number; encoding: 'utf8' | 'utf16le' | 'utf16be' }
   | { ok: false; reason: 'binary' | 'tooLarge' | 'unreadable'; byteLength?: number; errorCode?: string };
 
+export function textLooksBinary(content: string): boolean {
+  const sample = content.slice(0, 8192);
+  let controlCount = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const code = sample.charCodeAt(i);
+    if (code === 0) return true;
+    if (code < 7 || (code > 14 && code < 32)) controlCount++;
+  }
+  if (sample.length > 0 && controlCount / sample.length > 0.1) return true;
+
+  const replacementCount = sample.split('\ufffd').length - 1;
+  return replacementCount > Math.max(8, sample.length * 0.01);
+}
+
 function decodeTextBuffer(buffer: Buffer): { content: string; encoding: 'utf8' | 'utf16le' | 'utf16be' } | undefined {
   if (buffer.length >= 3
     && buffer[0] === 0xef
@@ -38,9 +52,7 @@ function decodeTextBuffer(buffer: Buffer): { content: string; encoding: 'utf8' |
   if (sampleLength > 0 && controlCount / sampleLength > 0.1) return undefined;
 
   const content = buffer.toString('utf8');
-  const decodedSample = content.slice(0, 8192);
-  const replacementCount = decodedSample.split('\ufffd').length - 1;
-  if (replacementCount > Math.max(8, decodedSample.length * 0.01)) return undefined;
+  if (textLooksBinary(content)) return undefined;
 
   return { content, encoding: 'utf8' };
 }

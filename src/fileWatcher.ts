@@ -8,7 +8,7 @@ import { StateManager } from './stateManager';
 import { canComputeHunks, computeHunks } from './diffEngine';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
-import { readTextFile, TextFileReadResult } from './fileContent';
+import { readTextFile, TextFileReadResult, textLooksBinary } from './fileContent';
 
 // Transform gitignore rules from a sub-directory so they work in a single
 // root-level matcher. Adds the directory's relative path as prefix, handling
@@ -49,6 +49,9 @@ export class FileWatcher {
   private onIgnoreRulesChanged: (() => void) | undefined;
   // Compiled ignore instance from workspace .gitignore
   private gitignoreMatcher: Ignore = ignoreLib();
+  private userIgnoreMatcher: Ignore = ignoreLib();
+  private userIgnoreKey: string = '';
+  private diskChangeTimers: Map<string, NodeJS.Timeout> = new Map();
   // When true, all file-system events are suppressed (used during branch switch)
   private _suppressed: boolean = false;
 
@@ -71,7 +74,7 @@ export class FileWatcher {
     this.disposables.push(gitignoreWatcher);
 
     const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    watcher.onDidChange(uri => this.onDiskChange(uri));
+    watcher.onDidChange(uri => this.scheduleDiskChange(uri));
     watcher.onDidDelete(uri => this.onDiskDelete(uri));
     watcher.onDidCreate(uri => this.onDiskCreate(uri));
     this.disposables.push(watcher);
@@ -163,6 +166,15 @@ export class FileWatcher {
     this.collectGitignores(rootPath, rootPath);
   }
 
+  private getUserIgnoreMatcher(): Ignore {
+    const key = JSON.stringify(this.stateManager.ignorePatterns);
+    if (key !== this.userIgnoreKey) {
+      this.userIgnoreMatcher = ignoreLib().add(this.stateManager.ignorePatterns);
+      this.userIgnoreKey = key;
+    }
+    return this.userIgnoreMatcher;
+  }
+
   /**
    * Recursively collect .gitignore files starting from `dir`.
    * Skips directories already ignored by the current matcher state.
@@ -250,12 +262,22 @@ export class FileWatcher {
     // returns false even though the pattern is meant to ignore that directory.
     if (isDirectory) relPath += '/';
 
-    const userMatcher = ignoreLib().add(this.stateManager.ignorePatterns);
-    if (userMatcher.ignores(relPath)) return true;
+    if (this.getUserIgnoreMatcher().ignores(relPath)) return true;
 
     if (this.stateManager.respectGitignore && this.gitignoreMatcher.ignores(relPath)) return true;
 
     return false;
+  }
+
+  private scheduleDiskChange(uri: vscode.Uri): void {
+    const filePath = normalizePath(uri.fsPath);
+    const existing = this.diskChangeTimers.get(filePath);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.diskChangeTimers.delete(filePath);
+      void this.onDiskChange(uri);
+    }, 75);
+    this.diskChangeTimers.set(filePath, timer);
   }
 
   private async onDiskCreate(uri: vscode.Uri): Promise<void> {
@@ -359,6 +381,10 @@ export class FileWatcher {
 
     const gitBaseline = fileState?.baseline ?? await git.getBaseline(filePath);
     log(`onDiskDelete(${basename}): external delete, gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
+    if (gitBaseline !== undefined && textLooksBinary(gitBaseline)) {
+      this.markReviewingUnavailable(filePath, '', { ok: false, reason: 'unreadable' });
+      return;
+    }
     if (gitBaseline === undefined) {
       // Not tracked at all — nothing to show
       if (fileState) {
@@ -404,6 +430,7 @@ export class FileWatcher {
 
     if (this.shouldIgnore(filePath)) return;
     if (this.selfEditFiles.has(filePath)) return;
+    if (this.stateManager.hasPendingFileSnapshot(filePath)) return;
 
     const diskRead = await readTextFile(filePath);
     if (!diskRead.ok && diskRead.errorCode === 'ENOENT') {
@@ -512,6 +539,7 @@ export class FileWatcher {
     this.stateManager.setFile(filePath, {
       status: 'reviewing',
       baseline,
+      baselineIsBinary: baseline !== null,
       diffUnavailable: true,
       diffUnavailableReason: read.reason,
     }, true);
@@ -523,6 +551,10 @@ export class FileWatcher {
       clearTimeout(timer);
     }
     this.debounceTimers.clear();
+    for (const timer of this.diskChangeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.diskChangeTimers.clear();
     this.pendingUserDeletes.clear();
     this.pendingRenameOldPaths.clear();
     this.disposables.forEach(d => d.dispose());

@@ -73,6 +73,22 @@ describe('HunkwiseGit', () => {
       await git.snapshot(filePath, content);
       assert.equal(await git.getBaseline(filePath), content);
     });
+
+    it('stores and restores binary file bytes', async () => {
+      const filePath = path.join(tmpDir, 'image.bin');
+      const original = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x10, 0x80]);
+      fs.writeFileSync(filePath, original);
+
+      await git.snapshotFile(filePath);
+      assert.equal(await git.hasBaseline(filePath), true);
+      assert.equal(await git.isFileContentUnchanged(filePath), true);
+
+      fs.writeFileSync(filePath, Buffer.from([0x00, 0x01, 0x02]));
+      assert.equal(await git.isFileContentUnchanged(filePath), false);
+
+      await git.restoreFile(filePath);
+      assert.deepEqual(fs.readFileSync(filePath), original);
+    });
   });
 
   describe('snapshotBatch', () => {

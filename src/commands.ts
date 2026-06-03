@@ -128,10 +128,11 @@ export function acceptFileByPath(
       log(`acceptFileByPath(${basename}): file exists, exitReviewing with content.len=${read.content.length}`);
       stateManager.exitReviewing(filePath, read.content);
     } else {
-      // Non-text or very large files cannot be snapshotted as line-review baselines.
-      // Treat file-level accept as accepting and untracking that file.
-      log(`acceptFileByPath(${basename}): text read unavailable (${read.reason}), removeFile`);
-      stateManager.removeFile(filePath);
+      // Non-text or very large files cannot be represented as line-review
+      // baselines, but they still need a byte-for-byte baseline so accepting a
+      // new image/binary file does not make it appear as new again on refresh.
+      log(`acceptFileByPath(${basename}): text read unavailable (${read.reason}), snapshot file bytes`);
+      stateManager.exitReviewingWithFileSnapshot(filePath);
     }
   }
   onStateChanged();
@@ -153,6 +154,13 @@ export async function discardFileByPath(
       if (fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
       }
+    } else if (fileState.baselineIsBinary) {
+      const git = stateManager.git;
+      if (!git) {
+        log(`discardFileByPath(${path.basename(filePath)}): no git available for binary restore`);
+        return;
+      }
+      await git.restoreFile(filePath);
     } else if (fileState.baseline === '' && fs.existsSync(filePath)) {
       // Existed as empty file — restore to empty
       const uri = vscode.Uri.file(filePath);

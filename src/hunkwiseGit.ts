@@ -80,6 +80,48 @@ export class HunkwiseGit {
     return stdout;
   }
 
+  private async gitBuffer(args: string[]): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        'git',
+        ['-c', 'core.quotepath=false', ...args],
+        {
+          cwd: this.workTree,
+          env: this.env,
+          encoding: 'buffer',
+          maxBuffer: 100 * 1024 * 1024,
+        },
+        (err, stdout, stderr) => {
+          if (err) {
+            reject(stderr?.length ? new Error(stderr.toString('utf-8')) : err);
+            return;
+          }
+          resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+        }
+      );
+    });
+  }
+
+  private async hashObject(content: string | Buffer): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const child = execFile(
+        'git',
+        ['hash-object', '-w', '--stdin'],
+        { env: this.env },
+        (err, stdout) => (err ? reject(err) : resolve(stdout.trim()))
+      );
+      if (Buffer.isBuffer(content)) {
+        child.stdin!.end(content);
+      } else {
+        child.stdin!.end(content, 'utf-8');
+      }
+    });
+  }
+
+  private async stageBlob(rel: string, hash: string, mode: string = '100644'): Promise<void> {
+    await this.git(['update-index', '--add', '--cacheinfo', `${mode},${hash},${rel}`]);
+  }
+
   // ── settings.json ─────────────────────────────────────────────────────────
 
   private get settingsPath(): string {
@@ -196,19 +238,28 @@ export class HunkwiseGit {
     await this.initGit();
     const rel = normalizePath(path.relative(this.workTree, filePath));
     try {
-      const hash = await new Promise<string>((resolve, reject) => {
-        const child = execFile(
-          'git',
-          ['hash-object', '-w', '--stdin'],
-          { env: this.env },
-          (err, stdout) => (err ? reject(err) : resolve(stdout.trim()))
-        );
-        child.stdin!.end(content, 'utf-8');
-      });
-      await this.git(['update-index', '--add', '--cacheinfo', `100644,${hash},${rel}`]);
+      const hash = await this.hashObject(content);
+      await this.stageBlob(rel, hash);
       await this.commit();
     } catch (err) {
       this.log(`snapshot failed for ${rel}: ${err}`);
+      throw err;
+    }
+  }
+
+  /**
+   * Snapshot the current file bytes from disk. This is used for binary or
+   * oversized files where line-review text content is unavailable.
+   */
+  async snapshotFile(filePath: string): Promise<void> {
+    await this.initGit();
+    const rel = normalizePath(path.relative(this.workTree, filePath));
+    try {
+      const hash = (await this.git(['hash-object', '-w', '--', rel])).trim();
+      await this.stageBlob(rel, hash);
+      await this.commit();
+    } catch (err) {
+      this.log(`snapshotFile failed for ${rel}: ${err}`);
       throw err;
     }
   }
@@ -286,18 +337,10 @@ export class HunkwiseGit {
     try {
       // Hash all blobs in parallel, then stage all at once and commit once
       const entries = await Promise.all(
-        files.map(({ filePath, content }) =>
-          new Promise<{ rel: string; hash: string }>((resolve, reject) => {
-            const rel = normalizePath(path.relative(this.workTree, filePath));
-            const child = execFile(
-              'git',
-              ['hash-object', '-w', '--stdin'],
-              { env: this.env },
-              (err, stdout) => (err ? reject(err) : resolve({ rel, hash: stdout.trim() }))
-            );
-            child.stdin!.end(content, 'utf-8');
-          })
-        )
+        files.map(async ({ filePath, content }) => {
+          const rel = normalizePath(path.relative(this.workTree, filePath));
+          return { rel, hash: await this.hashObject(content) };
+        })
       );
       // Stage all entries, chunked to avoid OS argument length limits
       const CHUNK = 100;
@@ -308,6 +351,39 @@ export class HunkwiseGit {
       await this.commit();
     } catch (err) {
       this.log(`snapshotBatch failed (${files.length} files): ${err}`);
+    }
+  }
+
+  /**
+   * Snapshot current file bytes for many files and commit once. Missing or
+   * unreadable files are skipped so a single transient file does not prevent
+   * the rest of a workspace snapshot.
+   */
+  async snapshotFileBatch(filePaths: string[]): Promise<void> {
+    if (filePaths.length === 0) return;
+    await this.initGit();
+    try {
+      const entries = (await Promise.all(
+        filePaths.map(async filePath => {
+          const rel = normalizePath(path.relative(this.workTree, filePath));
+          try {
+            const hash = (await this.git(['hash-object', '-w', '--', rel])).trim();
+            return { rel, hash };
+          } catch (err) {
+            this.log(`snapshotFileBatch skipped ${rel}: ${err}`);
+            return undefined;
+          }
+        })
+      )).filter((entry): entry is { rel: string; hash: string } => !!entry);
+
+      const CHUNK = 100;
+      for (let i = 0; i < entries.length; i += CHUNK) {
+        const cacheArgs = entries.slice(i, i + CHUNK).flatMap(({ rel, hash }) => ['--add', '--cacheinfo', `100644,${hash},${rel}`]);
+        await this.git(['update-index', ...cacheArgs]);
+      }
+      if (entries.length > 0) await this.commit();
+    } catch (err) {
+      this.log(`snapshotFileBatch failed (${filePaths.length} files): ${err}`);
     }
   }
 
@@ -350,6 +426,49 @@ export class HunkwiseGit {
       return await this.git(['show', `:${rel}`]);
     } catch {
       return undefined;
+    }
+  }
+
+  async hasBaseline(filePath: string): Promise<boolean> {
+    return (await this.getBaselineObjectId(filePath)) !== undefined;
+  }
+
+  async getBaselineObjectId(filePath: string): Promise<string | undefined> {
+    await this.initGit();
+    const rel = normalizePath(path.relative(this.workTree, filePath));
+    try {
+      const lsOut = await this.git(['ls-files', '--stage', '--', rel]);
+      const line = lsOut.trim().split('\n').find(Boolean);
+      const m = line?.match(/^\d+ ([0-9a-f]+) \d+\t.+$/);
+      return m?.[1];
+    } catch {
+      return undefined;
+    }
+  }
+
+  async isFileContentUnchanged(filePath: string): Promise<boolean | undefined> {
+    await this.initGit();
+    const rel = normalizePath(path.relative(this.workTree, filePath));
+    const baselineObjectId = await this.getBaselineObjectId(filePath);
+    if (!baselineObjectId) return undefined;
+    try {
+      const diskObjectId = (await this.git(['hash-object', '--', rel])).trim();
+      return diskObjectId === baselineObjectId;
+    } catch {
+      return false;
+    }
+  }
+
+  async restoreFile(filePath: string): Promise<void> {
+    await this.initGit();
+    const rel = normalizePath(path.relative(this.workTree, filePath));
+    try {
+      const content = await this.gitBuffer(['show', `:${rel}`]);
+      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.promises.writeFile(filePath, content);
+    } catch (err) {
+      this.log(`restoreFile failed for ${rel}: ${err}`);
+      throw err;
     }
   }
 

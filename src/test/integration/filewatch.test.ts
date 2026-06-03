@@ -339,6 +339,31 @@ suite('hunkwise file watcher integration', function () {
     assert.strictEqual(fileState?.baseline, null, 'Binary file should still have null baseline');
   });
 
+  test('accepted new binary file is snapshotted and does not reappear on refresh', async () => {
+    const root = getWorkspaceRoot();
+    await enableHunkwise();
+
+    const binaryFile = path.join(root, 'accepted-image.png');
+    fs.writeFileSync(binaryFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0xff, 0x80]));
+
+    const sm = getStateManager();
+    assert.ok(sm, 'StateManager should be available');
+
+    await waitForCondition(() => {
+      const f = sm.getFile(binaryFile);
+      return f?.status === 'reviewing' && f?.baseline === null;
+    }, 8000);
+
+    acceptFileByPath(sm, binaryFile, () => {});
+    await waitForCondition(() => !sm.getFile(binaryFile), 5000);
+
+    const rel = path.relative(root, binaryFile);
+    await waitForCondition(() => gitListTracked(root).includes(rel), 8000);
+
+    await vscode.commands.executeCommand('hunkwise.refresh');
+    assert.ok(!sm.getFile(binaryFile), 'Accepted binary file should not re-enter reviewing after refresh');
+  });
+
   test('externally created empty files enter reviewing with null baseline', async () => {
     const root = getWorkspaceRoot();
     await enableHunkwise();

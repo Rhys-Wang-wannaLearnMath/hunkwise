@@ -5,7 +5,7 @@ import { FileState } from './types';
 import { HunkwiseGit, Settings } from './hunkwiseGit';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
-import { readTextFile } from './fileContent';
+import { readTextFile, textLooksBinary } from './fileContent';
 
 const DEFAULT_IGNORE_PATTERNS = process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'];
 
@@ -49,6 +49,7 @@ export class StateManager {
   // Serial queue: git ops run one at a time; flush() awaits the tail
   private gitQueue: Promise<void> = Promise.resolve();
   private pendingBaselineSnapshots: Map<string, string> = new Map();
+  private pendingFileSnapshots: Set<string> = new Set();
 
   // Optional callback invoked when a git failure causes an in-memory rollback
   // (e.g. exitReviewing snapshot fails and reviewing state is restored).
@@ -134,6 +135,55 @@ export class StateManager {
     return this._git;
   }
 
+  private async stateFromTrackedFile(g: HunkwiseGit, filePath: string): Promise<FileState | 'idle' | undefined> {
+    const diskRead = await readTextFile(filePath);
+
+    if (diskRead.ok) {
+      const baseline = await g.getBaseline(filePath);
+      if (baseline === undefined) return undefined;
+      return diskRead.content !== baseline
+        ? { status: 'reviewing', baseline }
+        : 'idle';
+    }
+
+    if (diskRead.errorCode === 'ENOENT') {
+      const baseline = await g.getBaseline(filePath);
+      if (baseline !== undefined) {
+        if (textLooksBinary(baseline)) {
+          return {
+            status: 'reviewing',
+            baseline: '',
+            baselineIsBinary: true,
+            diffUnavailable: true,
+            diffUnavailableReason: 'unreadable',
+          };
+        }
+        return { status: 'reviewing', baseline };
+      }
+      if (await g.hasBaseline(filePath)) {
+        return {
+          status: 'reviewing',
+          baseline: '',
+          baselineIsBinary: true,
+          diffUnavailable: true,
+          diffUnavailableReason: 'unreadable',
+        };
+      }
+      return undefined;
+    }
+
+    if (!await g.hasBaseline(filePath)) return undefined;
+    const unchanged = await g.isFileContentUnchanged(filePath);
+    if (unchanged) return 'idle';
+    return {
+      status: 'reviewing',
+      baseline: '',
+      baselineIsBinary: true,
+      diffUnavailable: true,
+      diffUnavailableReason: diskRead.reason,
+    };
+  }
+
   /**
    * Load persistent state from settings.json + git repo.
    * Must be called once at activation. Async because reading baselines
@@ -169,28 +219,16 @@ export class StateManager {
         ignored.push(filePath);
         return;
       }
-      const baseline = await g.getBaseline(filePath);
-      if (baseline === undefined) {
+      const nextState = await this.stateFromTrackedFile(g, filePath);
+      if (nextState === undefined) {
         skippedNoBaseline.push(filePath);
         return;
       }
-      // Compare baseline with current disk content — enter reviewing if there's a real diff
-      // or if the file has been deleted (so the user can restore it via discard).
-      // Use a single readFile call to avoid TOCTOU race (existsSync + readFile).
-      let diskContent: string | undefined;
-      let fileDeleted = false;
-      const diskRead = await readTextFile(filePath);
-      if (diskRead.ok) {
-        diskContent = diskRead.content;
-      } else {
-        if (diskRead.errorCode === 'ENOENT') { fileDeleted = true; } // file doesn't exist
-        // other errors / non-text files → diskContent stays undefined, treat as idle
-      }
-      if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
-        this.state.set(filePath, { status: 'reviewing', baseline });
-        reviewing.push(filePath);
-      } else {
+      if (nextState === 'idle') {
         idle.push(filePath);
+      } else {
+        this.state.set(filePath, nextState);
+        reviewing.push(filePath);
       }
     }));
     if (skippedNoBaseline.length > 0) {
@@ -248,18 +286,9 @@ export class StateManager {
     const tracked = await g.listTrackedFiles();
     const filtered = tracked.filter(fp => !shouldIgnore?.(fp));
     await Promise.all(filtered.map(async filePath => {
-      const baseline = await g.getBaseline(filePath);
-      if (baseline === undefined) return;
-      let diskContent: string | undefined;
-      let fileDeleted = false;
-      const diskRead = await readTextFile(filePath);
-      if (diskRead.ok) {
-        diskContent = diskRead.content;
-      } else {
-        if (diskRead.errorCode === 'ENOENT') { fileDeleted = true; }
-      }
-      if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
-        this.state.set(filePath, { status: 'reviewing', baseline });
+      const nextState = await this.stateFromTrackedFile(g, filePath);
+      if (nextState !== undefined && nextState !== 'idle') {
+        this.state.set(filePath, nextState);
       }
     }));
 
@@ -492,6 +521,10 @@ export class StateManager {
     return this.pendingBaselineSnapshots.get(normalizePath(filePath));
   }
 
+  hasPendingFileSnapshot(filePath: string): boolean {
+    return this.pendingFileSnapshots.has(normalizePath(filePath));
+  }
+
   getAllFiles(): ReadonlyMap<string, FileState> {
     return this.state;
   }
@@ -537,6 +570,33 @@ export class StateManager {
     }
   }
 
+  /**
+   * Exit reviewing and snapshot current bytes from disk. Used for binary or
+   * oversized files where a text baseline cannot be represented safely.
+   */
+  exitReviewingWithFileSnapshot(filePath: string): void {
+    filePath = normalizePath(filePath);
+    const oldState = this.state.has(filePath) ? { ...this.state.get(filePath)! } : undefined;
+    this.state.delete(filePath);
+    if (this._git) {
+      const g = this._git;
+      this.pendingFileSnapshots.add(filePath);
+      this.gitQueue = this.gitQueue.then(() => g.snapshotFile(filePath)).then(() => {
+        this.pendingFileSnapshots.delete(filePath);
+      }).catch(err => {
+        this.pendingFileSnapshots.delete(filePath);
+        log(`git queue error (exitReviewingWithFileSnapshot rollback): ${err}`);
+        if (!this.state.has(filePath) && oldState) {
+          this.state.set(filePath, { ...oldState });
+          this.onRollback?.();
+          void vscode.window.showErrorMessage(
+            `Failed to update review baseline for ${path.basename(filePath)}. The file has been kept in reviewing so you can retry.`
+          );
+        }
+      });
+    }
+  }
+
 
   // ── settings ──────────────────────────────────────────────────────────────
 
@@ -558,6 +618,7 @@ export class StateManager {
     } else {
       this.state.clear();
       this.pendingBaselineSnapshots.clear();
+      this.pendingFileSnapshots.clear();
       this._git?.destroyGit();
       this._git = undefined;
     }
@@ -594,17 +655,8 @@ export class StateManager {
     };
 
     const filePaths = await collect(this.workspaceRoot);
-    const batch: { filePath: string; content: string }[] = [];
-    await Promise.all(filePaths.map(async filePath => {
-      try {
-        const read = await readTextFile(filePath);
-        if (read.ok) batch.push({ filePath, content: read.content });
-      } catch {
-        // Skip binary or unreadable files
-      }
-    }));
-    if (batch.length > 0) {
-      await g.snapshotBatch(batch);
+    if (filePaths.length > 0) {
+      await g.snapshotFileBatch(filePaths);
     }
   }
 
@@ -754,16 +806,7 @@ export class StateManager {
       log(`syncIgnoreState: adding ${toAdd.length} file(s): ${logFileList(toAdd, this.workspaceRoot)}`);
     }
     if (toAdd.length > 0) {
-      const batch: { filePath: string; content: string }[] = [];
-      await Promise.all(toAdd.map(async fp => {
-        try {
-          const read = await readTextFile(fp);
-          if (read.ok) batch.push({ filePath: fp, content: read.content });
-        } catch { /* skip unreadable */ }
-      }));
-      if (batch.length > 0) {
-        this.gitQueue = this.gitQueue.then(() => g.snapshotBatch(batch)).catch(err => { log(`git queue error: ${err}`); });
-      }
+      this.gitQueue = this.gitQueue.then(() => g.snapshotFileBatch(toAdd)).catch(err => { log(`git queue error: ${err}`); });
     }
 
     // Wait for all queued git operations to complete
@@ -817,22 +860,14 @@ export class StateManager {
 
     // Snapshot all disk files as new baselines
     const diskSet = new Set(diskFiles);
-    const batch: { filePath: string; content: string }[] = [];
-    await Promise.all(diskFiles.map(async fp => {
-      try {
-        const read = await readTextFile(fp);
-        if (read.ok) batch.push({ filePath: fp, content: read.content });
-      } catch { /* skip unreadable */ }
-    }));
-
     // Remove baselines for files that no longer exist on disk
     const toRemove = trackedFiles.filter(fp => !diskSet.has(fp));
 
     if (toRemove.length > 0) {
       this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(toRemove)).catch(err => { log(`git queue error: ${err}`); });
     }
-    if (batch.length > 0) {
-      this.gitQueue = this.gitQueue.then(() => g.snapshotBatch(batch)).catch(err => { log(`git queue error: ${err}`); });
+    if (diskFiles.length > 0) {
+      this.gitQueue = this.gitQueue.then(() => g.snapshotFileBatch(diskFiles)).catch(err => { log(`git queue error: ${err}`); });
     }
 
     // Wait for all git ops to complete before returning
@@ -853,6 +888,7 @@ export class StateManager {
     this._autoEnable = false;
     this.state.clear();
     this.pendingBaselineSnapshots.clear();
+    this.pendingFileSnapshots.clear();
     this._git = undefined;
     this.gitQueue = Promise.resolve();
   }
