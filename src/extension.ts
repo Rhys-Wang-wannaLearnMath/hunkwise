@@ -11,7 +11,7 @@ import { canComputeHunks, computeHunks, hunkId } from './diffEngine';
 import { initLog, log } from './log';
 import { upsertGitignore } from './gitignoreManager';
 import { CodexSignal } from './codexSignal';
-import { installCodexHook, isCodexHookInstalled } from './codexHookInstaller';
+import { installCodexHook, isCodexHookInstalled, repairCodexHookIfNeeded } from './codexHookInstaller';
 
 export async function activate(context: vscode.ExtensionContext): Promise<{ getReviewPanel: () => ReviewPanel | undefined; getStateManager: () => StateManager | undefined; getFileWatcher: () => FileWatcher | undefined }> {
   initLog();
@@ -307,6 +307,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
   );
 
   if (codexWorkspaceRoot) {
+    // Auto-heal hooks left by older versions that used a bare `node` command,
+    // which fails with exit 127 under Codex's sanitized PATH.
+    if (codexHunkwiseDir) {
+      try {
+        const repaired = repairCodexHookIfNeeded(context.extensionUri.fsPath, codexWorkspaceRoot, codexHunkwiseDir);
+        if (repaired) log(`codex hook repaired: interpreter=${repaired.interpreter} resolved=${repaired.nodeResolved}`);
+      } catch (err) {
+        log(`repairCodexHookIfNeeded failed: ${err}`);
+      }
+    }
     reviewPanel.setCodexHookInstalled(isCodexHookInstalled(codexWorkspaceRoot));
   }
 
@@ -360,9 +370,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
         reviewPanel?.refresh();
         const verb = result.status === 'alreadyPresent' ? 'already installed'
           : result.status === 'updated' ? 'updated' : 'installed';
-        void vscode.window.showInformationMessage(
-          `hunkwise: Codex hook ${verb}. Run /hooks in Codex to trust it, then turn on "Only track Codex edits".`
-        );
+        if (!result.nodeResolved) {
+          void vscode.window.showWarningMessage(
+            `hunkwise: Codex hook ${verb}, but no node binary was found automatically. Ensure "node" is on PATH or the hook will fail with exit 127.`
+          );
+        } else {
+          void vscode.window.showInformationMessage(
+            `hunkwise: Codex hook ${verb}. Run /hooks in Codex to trust it, then turn on "Only track Codex edits".`
+          );
+        }
       } catch (err) {
         log(`installCodexHook failed: ${err}`);
         void vscode.window.showErrorMessage(`hunkwise: failed to install Codex hook — ${err}`);
