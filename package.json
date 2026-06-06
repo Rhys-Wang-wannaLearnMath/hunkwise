@@ -51,6 +51,10 @@
       {
         "command": "hunkwise.nextHunk",
         "title": "hunkwise: Next Change"
+      },
+      {
+        "command": "hunkwise.installCodexHook",
+        "title": "hunkwise: Install Codex Hook"
       }
     ],
     "keybindings": [

@@ -11,7 +11,7 @@ export interface ParsedHunk {
 
 export const MAX_DIFF_INPUT_CHARS = 1_500_000;
 export const MAX_DIFF_INPUT_LINES = 50000;
-const MAX_CACHED_DIFFS = 12;
+const MAX_CACHED_DIFFS = 128;
 const MAX_CACHED_DIFF_CHARS = 300_000;
 
 interface CachedDiff {
@@ -21,10 +21,24 @@ interface CachedDiff {
 }
 
 // Diff results are requested repeatedly by decorations, CodeLens, navigation,
-// and the review panel for the same document version. Keep a deliberately small
-// cache so those callers share the expensive diffLines result without retaining
-// large editor buffers indefinitely.
-const diffCache: CachedDiff[] = [];
+// and the review panel for the same document version, and across many reviewing
+// files at once. Cache keyed by a cheap content fingerprint (length + hash) with
+// full verification on hit to avoid collisions; LRU eviction via Map order.
+const diffCache = new Map<string, CachedDiff>();
+
+function hashStr(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return h >>> 0;
+}
+
+function diffKey(baseline: string | null, current: string): string {
+  const bl = baseline === null ? -1 : baseline.length;
+  const bh = baseline === null ? 0 : hashStr(baseline);
+  return `${bl}:${bh}:${current.length}:${hashStr(current)}`;
+}
 
 function countLines(s: string): number {
   let lines = 1;
@@ -47,10 +61,11 @@ export function hunkId(hunk: ParsedHunk): string {
 }
 
 export function computeHunks(baseline: string | null, current: string): ParsedHunk[] {
-  const cachedIndex = diffCache.findIndex(entry => entry.baseline === baseline && entry.current === current);
-  if (cachedIndex !== -1) {
-    const [cached] = diffCache.splice(cachedIndex, 1);
-    diffCache.push(cached);
+  const key = diffKey(baseline, current);
+  const cached = diffCache.get(key);
+  if (cached && cached.baseline === baseline && cached.current === current) {
+    diffCache.delete(key);
+    diffCache.set(key, cached); // bump to most-recently-used
     return cached.hunks;
   }
 
@@ -109,8 +124,12 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
   }
 
   if ((baseline?.length ?? 0) + current.length <= MAX_CACHED_DIFF_CHARS) {
-    diffCache.push({ baseline, current, hunks });
-    if (diffCache.length > MAX_CACHED_DIFFS) diffCache.shift();
+    diffCache.delete(key);
+    diffCache.set(key, { baseline, current, hunks });
+    if (diffCache.size > MAX_CACHED_DIFFS) {
+      const oldest = diffCache.keys().next().value;
+      if (oldest !== undefined) diffCache.delete(oldest);
+    }
   }
 
   return hunks;

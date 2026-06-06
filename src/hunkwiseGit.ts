@@ -15,7 +15,35 @@ export interface Settings {
   quoteRotationInterval: number;
   useDiffEditor: boolean;
   showInlineDecorations: boolean;
+  /** Only review files edited by Codex CLI (driven by the installed Codex hook). */
+  codexOnly?: boolean;
+  /** Only track code/document-like files (by extension/filename allowlist). */
+  trackCodeDocsOnly?: boolean;
+  /** Allowlist of extensions (no dot) or exact filenames tracked when trackCodeDocsOnly is on. */
+  trackedExtensions?: string[];
 }
+
+/**
+ * Default allowlist for "only track code/document files" mode. Entries are
+ * lowercase extensions (without the dot) or exact filenames (for common
+ * extensionless files). Users can fully customize this list in settings.
+ */
+export const DEFAULT_TRACKED_EXTENSIONS: string[] = [
+  // code
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'mts', 'cts',
+  'py', 'rb', 'php', 'go', 'rs', 'java', 'kt', 'kts', 'scala', 'clj', 'dart', 'swift',
+  'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'hh', 'cs', 'm', 'mm', 'r', 'lua', 'pl', 'pm',
+  'ex', 'exs', 'erl', 'hs', 'fs', 'ml',
+  'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
+  'html', 'htm', 'css', 'scss', 'sass', 'less', 'vue', 'svelte', 'astro',
+  'sql', 'graphql', 'gql', 'proto',
+  // config / data (code-adjacent)
+  'json', 'jsonc', 'yaml', 'yml', 'toml', 'xml', 'ini', 'cfg', 'conf', 'properties', 'env',
+  // docs
+  'md', 'mdx', 'markdown', 'rst', 'adoc', 'txt', 'tex',
+  // common extensionless files
+  'Dockerfile', 'Makefile', 'Rakefile', 'Gemfile', 'Procfile',
+];
 
 const DEFAULT_SETTINGS: Settings = {
   settingsVersion: 2,
@@ -26,6 +54,9 @@ const DEFAULT_SETTINGS: Settings = {
   quoteRotationInterval: 30,
   useDiffEditor: true,
   showInlineDecorations: true,
+  codexOnly: false,
+  trackCodeDocsOnly: false,
+  trackedExtensions: [...DEFAULT_TRACKED_EXTENSIONS],
 };
 
 /**
@@ -150,9 +181,22 @@ export class HunkwiseGit {
         showInlineDecorations: typeof parsed.showInlineDecorations === 'boolean'
           ? parsed.showInlineDecorations
           : DEFAULT_SETTINGS.showInlineDecorations,
+        codexOnly: typeof parsed.codexOnly === 'boolean'
+          ? parsed.codexOnly
+          : DEFAULT_SETTINGS.codexOnly,
+        trackCodeDocsOnly: typeof parsed.trackCodeDocsOnly === 'boolean'
+          ? parsed.trackCodeDocsOnly
+          : DEFAULT_SETTINGS.trackCodeDocsOnly,
+        trackedExtensions: Array.isArray(parsed.trackedExtensions)
+          ? parsed.trackedExtensions.filter((x): x is string => typeof x === 'string' && x.length > 0)
+          : [...(DEFAULT_SETTINGS.trackedExtensions ?? [])],
       };
     } catch {
-      return { ...DEFAULT_SETTINGS, ignorePatterns: [...DEFAULT_SETTINGS.ignorePatterns] };
+      return {
+        ...DEFAULT_SETTINGS,
+        ignorePatterns: [...DEFAULT_SETTINGS.ignorePatterns],
+        trackedExtensions: [...(DEFAULT_SETTINGS.trackedExtensions ?? [])],
+      };
     }
   }
 

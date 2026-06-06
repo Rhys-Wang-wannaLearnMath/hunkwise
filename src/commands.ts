@@ -44,6 +44,18 @@ export function registerCommands(
       );
       onStateChanged();
     }),
+    vscode.commands.registerCommand('hunkwise.setTrackCodeDocsOnly', async (value: boolean) => {
+      stateManager.setTrackCodeDocsOnly(value);
+      onStateChanged();
+      await stateManager.syncIgnoreState((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+      onStateChanged();
+    }),
+    vscode.commands.registerCommand('hunkwise.setTrackedExtensions', async (extensions: string[]) => {
+      stateManager.setTrackedExtensions(extensions);
+      onStateChanged();
+      await stateManager.syncIgnoreState((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+      onStateChanged();
+    }),
   );
 }
 

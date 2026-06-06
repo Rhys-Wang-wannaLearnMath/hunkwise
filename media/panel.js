@@ -3,7 +3,7 @@
 const vscode = /** @type {any} */ (globalThis).acquireVsCodeApi();
 const app = document.getElementById('app');
 
-/** @type {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] } | null} */
+/** @type {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, codexOnly: boolean, codexHookInstalled: boolean, trackCodeDocsOnly: boolean, trackedExtensions: string[], totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] } | null} */
 let currentState = null;
 /** @type {Set<string>} */
 const expandedFiles = new Set();
@@ -121,7 +121,7 @@ function appendIcon(parent) {
 }
 
 /**
- * @param {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] }} state
+ * @param {{ enabled: boolean, ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, codexOnly: boolean, codexHookInstalled: boolean, trackCodeDocsOnly: boolean, trackedExtensions: string[], totalFiles: number, totalHunks: number, totalAdded: number, totalRemoved: number, files: any[] }} state
  */
 function render(state) {
   if (!app) return;
@@ -196,7 +196,7 @@ function renderIdleScreen(quoteRotationInterval) {
 }
 
 /**
- * @param {{ ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean }} state
+ * @param {{ ignorePatterns: string[], respectGitignore: boolean, clearOnBranchSwitch: boolean, autoEnable: boolean, quoteRotationInterval: number, useDiffEditor: boolean, showInlineDecorations: boolean, codexOnly: boolean, codexHookInstalled: boolean, trackCodeDocsOnly: boolean, trackedExtensions: string[] }} state
  */
 function renderSettingsScreen(state) {
   if (!app) return;
@@ -212,6 +212,104 @@ function renderSettingsScreen(state) {
   app.appendChild(header);
 
   const body = el('div', 'settings-body');
+
+  // ── Codex CLI ──
+  const codexSection = el('div', 'settings-section');
+  codexSection.appendChild(el('div', 'settings-section-title', 'Codex CLI'));
+  codexSection.appendChild(el('p', 'settings-section-desc', 'Only review changes made by Codex CLI. Other edits (yours or other tools) are silently accepted into the baseline.'));
+
+  const codexRow = el('label', 'settings-check-row');
+  codexRow.appendChild(el('span', 'settings-check-label', 'Only track Codex CLI edits'));
+  const codexDescRow = el('div', 'settings-check-desc-row');
+  const codexCheckbox = /** @type {HTMLInputElement} */ (document.createElement('input'));
+  codexCheckbox.type = 'checkbox';
+  codexCheckbox.className = 'settings-checkbox';
+  codexCheckbox.checked = state.codexOnly;
+  codexCheckbox.addEventListener('change', () => {
+    vscode.postMessage({ command: 'setCodexOnly', value: codexCheckbox.checked });
+  });
+  codexDescRow.appendChild(codexCheckbox);
+  codexDescRow.appendChild(el('span', 'settings-check-desc', 'Requires the Codex hook below, trusted via /hooks in Codex'));
+  codexRow.appendChild(codexDescRow);
+  codexSection.appendChild(codexRow);
+
+  const hookRow = el('div', 'settings-input-row');
+  const hookLabel = el('div', 'settings-check-text');
+  hookLabel.appendChild(el('span', 'settings-check-label', 'Codex hook'));
+  hookLabel.appendChild(el('span', 'settings-check-desc',
+    state.codexHookInstalled
+      ? 'Installed in .codex/hooks.json. Run /hooks in Codex to trust it.'
+      : 'Not installed. Install to start recording Codex edits.'));
+  hookRow.appendChild(hookLabel);
+  const hookBtn = /** @type {HTMLButtonElement} */ (el('button', 'pattern-add-btn', state.codexHookInstalled ? 'Reinstall' : 'Install'));
+  hookBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    vscode.postMessage({ command: 'installCodexHook' });
+  });
+  hookRow.appendChild(hookBtn);
+  codexSection.appendChild(hookRow);
+
+  if (state.codexOnly && !state.codexHookInstalled) {
+    const warn = el('p', 'settings-section-desc', '⚠ Codex-only mode is on but the hook is not installed — nothing will be reviewed until you install and trust it.');
+    warn.style.color = 'var(--vscode-editorWarning-foreground, #cca700)';
+    codexSection.appendChild(warn);
+  }
+
+  // ── File Types ──
+  const fileTypesSection = el('div', 'settings-section');
+  fileTypesSection.appendChild(el('div', 'settings-section-title', 'File Types'));
+  fileTypesSection.appendChild(el('p', 'settings-section-desc', 'Optionally track only code/document file types; everything else is ignored.'));
+
+  const ftRow = el('label', 'settings-check-row');
+  ftRow.appendChild(el('span', 'settings-check-label', 'Only track code/document files'));
+  const ftDescRow = el('div', 'settings-check-desc-row');
+  const ftCheckbox = /** @type {HTMLInputElement} */ (document.createElement('input'));
+  ftCheckbox.type = 'checkbox';
+  ftCheckbox.className = 'settings-checkbox';
+  ftCheckbox.checked = state.trackCodeDocsOnly;
+  ftCheckbox.addEventListener('change', () => {
+    vscode.postMessage({ command: 'setTrackCodeDocsOnly', value: ftCheckbox.checked });
+  });
+  ftDescRow.appendChild(ftCheckbox);
+  ftDescRow.appendChild(el('span', 'settings-check-desc', 'Limit tracking to the extensions/filenames below'));
+  ftRow.appendChild(ftDescRow);
+  fileTypesSection.appendChild(ftRow);
+
+  // The customizable allowlist is only shown (and relevant) when the mode is on.
+  if (state.trackCodeDocsOnly) {
+    const extList = el('div', 'pattern-list');
+    for (const ext of state.trackedExtensions) {
+      const inner = el('div', 'pattern-row-inner');
+      inner.appendChild(el('span', 'pattern-text', ext));
+      const delBtn = el('button', 'pattern-del', '');
+      delBtn.title = 'Remove';
+      delBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        vscode.postMessage({ command: 'setTrackedExtensions', extensions: state.trackedExtensions.filter(x => x !== ext) });
+      });
+      inner.appendChild(delBtn);
+      extList.appendChild(inner);
+    }
+    const extAddRow = el('div', 'pattern-add-row');
+    const extInput = /** @type {HTMLInputElement} */ (document.createElement('input'));
+    extInput.type = 'text';
+    extInput.className = 'pattern-input';
+    extInput.placeholder = 'e.g. ts, md, Dockerfile';
+    const extAddBtn = el('button', 'pattern-add-btn', 'Add');
+    extAddBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      const val = extInput.value.trim().replace(/^\./, '');
+      if (val && !state.trackedExtensions.includes(val)) {
+        vscode.postMessage({ command: 'setTrackedExtensions', extensions: [...state.trackedExtensions, val] });
+      }
+      extInput.value = '';
+    });
+    extInput.addEventListener('keydown', e => { if (e.key === 'Enter') extAddBtn.click(); });
+    extAddRow.appendChild(extInput);
+    extAddRow.appendChild(extAddBtn);
+    extList.appendChild(extAddRow);
+    fileTypesSection.appendChild(extList);
+  }
 
   // ── Respect .gitignore ──
   const gitignoreSection = el('div', 'settings-section');
@@ -366,6 +464,8 @@ function renderSettingsScreen(state) {
   addRow.appendChild(addBtn);
   patternList.appendChild(addRow);
   patternSection.appendChild(patternList);
+  body.appendChild(codexSection);
+  body.appendChild(fileTypesSection);
   body.appendChild(appearanceSection);
   body.appendChild(patternSection);
   body.appendChild(gitignoreSection);

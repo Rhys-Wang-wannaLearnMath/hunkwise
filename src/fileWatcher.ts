@@ -9,6 +9,11 @@ import { canComputeHunks, computeHunks } from './diffEngine';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
 import { readTextFile, TextFileReadResult, textLooksBinary } from './fileContent';
+import { CodexSignal } from './codexSignal';
+
+// In codex-only mode, a file change not (yet) attributed to Codex waits this long
+// for the Codex signal to arrive before being silently absorbed into the baseline.
+const CODEX_GRACE_MS = 1500;
 
 // Transform gitignore rules from a sub-directory so they work in a single
 // root-level matcher. Adds the directory's relative path as prefix, handling
@@ -54,6 +59,11 @@ export class FileWatcher {
   private diskChangeTimers: Map<string, NodeJS.Timeout> = new Map();
   // When true, all file-system events are suppressed (used during branch switch)
   private _suppressed: boolean = false;
+  // codex-only mode: signal source + per-file grace timers for unattributed changes
+  private codexSignal: CodexSignal | undefined;
+  private pendingCodexGate: Map<string, NodeJS.Timeout> = new Map();
+  // Cache the trackedExtensions Set, rebuilt only when the source array changes.
+  private trackedExtCache: { source: string[]; set: Set<string> } | undefined;
 
   constructor(
     private stateManager: StateManager,
@@ -216,6 +226,10 @@ export class FileWatcher {
     this._suppressed = false;
   }
 
+  setCodexSignal(signal: CodexSignal | undefined): void {
+    this.codexSignal = signal;
+  }
+
   markSelfEdit(filePath: string): void {
     this.selfEditFiles.add(normalizePath(filePath));
   }
@@ -234,6 +248,13 @@ export class FileWatcher {
     const hunkwiseDir = this.stateManager.dir;
     if (hunkwiseDir && filePath.startsWith(hunkwiseDir + path.sep)) return true;
     if (hunkwiseDir && filePath === hunkwiseDir) return true;
+
+    // "Only track code/document files" mode: ignore files whose extension/name
+    // is not in the allowlist. Directories are never filtered here so traversal
+    // can still reach allowed files inside them.
+    if (this.stateManager.trackCodeDocsOnly && !isDirectory && !this.matchesTrackedExtension(filePath)) {
+      return true;
+    }
 
     const rootPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!rootPath) return false;
@@ -269,6 +290,27 @@ export class FileWatcher {
     return false;
   }
 
+  private getTrackedExtSet(): Set<string> {
+    const source = this.stateManager.trackedExtensions;
+    if (!this.trackedExtCache || this.trackedExtCache.source !== source) {
+      this.trackedExtCache = { source, set: new Set(source) };
+    }
+    return this.trackedExtCache.set;
+  }
+
+  /** Whether a file's extension or exact name is in the tracked allowlist. */
+  private matchesTrackedExtension(filePath: string): boolean {
+    const set = this.getTrackedExtSet();
+    if (set.size === 0) return true; // empty allowlist → don't hide everything
+    const base = path.basename(filePath);
+    if (set.has(base)) return true; // exact filename, e.g. Dockerfile
+    const dot = base.lastIndexOf('.');
+    if (dot > 0) {
+      if (set.has(base.slice(dot + 1).toLowerCase())) return true;
+    }
+    return false;
+  }
+
   private scheduleDiskChange(uri: vscode.Uri): void {
     const filePath = normalizePath(uri.fsPath);
     const existing = this.diskChangeTimers.get(filePath);
@@ -289,43 +331,43 @@ export class FileWatcher {
     if (this.selfEditFiles.has(filePath)) return;
 
     const fileState = this.stateManager.getFile(filePath);
-    log(`onDiskCreate(${basename}): fileState=${fileState ? `{status:${fileState.status}, baseline.len:${fileState.baseline?.length ?? 'null'}}` : 'undefined'}`);
+    log(() => `onDiskCreate(${basename}): fileState=${fileState ? `{status:${fileState.status}, baseline.len:${fileState.baseline?.length ?? 'null'}}` : 'undefined'}`);
     if (fileState?.status === 'reviewing') {
       // File was deleted (showing deletion hunk) but now re-created — recompute
       const diskRead = await readTextFile(filePath);
       if (!diskRead.ok) {
-        log(`onDiskCreate(${basename}): text read unavailable while reviewing (${diskRead.reason}), keeping file-level review`);
+        log(() => `onDiskCreate(${basename}): text read unavailable while reviewing (${diskRead.reason}), keeping file-level review`);
         this.markReviewingUnavailable(filePath, fileState.baseline, diskRead);
         return;
       }
-      log(`onDiskCreate(${basename}): reviewing, recompute hunks (baseline.len=${fileState.baseline?.length ?? 'null'}, disk.len=${diskRead.content.length})`);
+      log(() => `onDiskCreate(${basename}): reviewing, recompute hunks (baseline.len=${fileState.baseline?.length ?? 'null'}, disk.len=${diskRead.content.length})`);
       this.recomputeHunks(filePath, fileState.baseline, diskRead.content);
       return;
     }
-    if (fileState) { log(`onDiskCreate(${basename}): has fileState but not reviewing, skip`); return; }
+    if (fileState) { log(() => `onDiskCreate(${basename}): has fileState but not reviewing, skip`); return; }
 
     const git = this.stateManager.git;
-    if (!git) { log(`onDiskCreate(${basename}): no git, skip`); return; }
+    if (!git) { log(() => `onDiskCreate(${basename}): no git, skip`); return; }
 
     const diskRead = await readTextFile(filePath);
     if (!diskRead.ok) {
       const gitBaseline = await git.getBaseline(filePath);
-      log(`onDiskCreate(${basename}): text read unavailable (${diskRead.reason}), enter file-level review`);
+      log(() => `onDiskCreate(${basename}): text read unavailable (${diskRead.reason}), enter file-level review`);
       this.markReviewingUnavailable(filePath, gitBaseline ?? null, diskRead);
       return;
     }
 
     const gitBaseline = await git.getBaseline(filePath);
-    log(`onDiskCreate(${basename}): gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
+    log(() => `onDiskCreate(${basename}): gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
     if (gitBaseline !== undefined) {
       // Hunkwise already has a baseline — treat as a change
-      log(`onDiskCreate(${basename}): has baseline, enterReviewing as change`);
+      log(() => `onDiskCreate(${basename}): has baseline, enterReviewing as change`);
       this.enterReviewing(filePath, gitBaseline, diskRead.content);
       return;
     }
 
     // External tool created this file — show as new file hunk (null = file didn't exist before)
-    log(`onDiskCreate(${basename}): external create, enterReviewing as NEW`);
+    log(() => `onDiskCreate(${basename}): external create, enterReviewing as NEW`);
     this.enterReviewing(filePath, null, diskRead.content);
   }
 
@@ -343,7 +385,7 @@ export class FileWatcher {
     if (this.pendingRenameOldPaths.has(filePath)) {
       // User-initiated rename — renameFile already migrated state+git, nothing to do
       this.pendingRenameOldPaths.delete(filePath);
-      log(`onDiskDelete(${basename}): rename old path, skip`);
+      log(() => `onDiskDelete(${basename}): rename old path, skip`);
       return;
     }
 
@@ -351,7 +393,7 @@ export class FileWatcher {
       // User-initiated delete (explorer / VSCode API) — treat as manual, remove baseline.
       // Always go through stateManager.removeFile so git ops are serialized via gitQueue.
       this.pendingUserDeletes.delete(filePath);
-      log(`onDiskDelete(${basename}): user delete, removeFile`);
+      log(() => `onDiskDelete(${basename}): user delete, removeFile`);
       this.stateManager.removeFile(filePath);
       // Also clean up child files when a directory is deleted via VSCode
       const dirPrefix = filePath + path.sep;
@@ -369,18 +411,18 @@ export class FileWatcher {
     }
 
     // External tool deleted the file
-    if (!git) { log(`onDiskDelete(${basename}): no git, skip`); return; }
+    if (!git) { log(() => `onDiskDelete(${basename}): no git, skip`); return; }
 
     // If file was new (null baseline), just clean up — nothing to show, nothing in git
     if (fileState?.baseline === null) {
-      log(`onDiskDelete(${basename}): new file (null baseline) deleted, removing fileState`);
+      log(() => `onDiskDelete(${basename}): new file (null baseline) deleted, removing fileState`);
       this.stateManager.exitReviewing(filePath);
       this.onStateChanged();
       return;
     }
 
     const gitBaseline = fileState?.baseline ?? await git.getBaseline(filePath);
-    log(`onDiskDelete(${basename}): external delete, gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
+    log(() => `onDiskDelete(${basename}): external delete, gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
     if (gitBaseline !== undefined && textLooksBinary(gitBaseline)) {
       this.markReviewingUnavailable(filePath, '', { ok: false, reason: 'unreadable' });
       return;
@@ -388,7 +430,7 @@ export class FileWatcher {
     if (gitBaseline === undefined) {
       // Not tracked at all — nothing to show
       if (fileState) {
-        log(`onDiskDelete(${basename}): no baseline, removing fileState`);
+        log(() => `onDiskDelete(${basename}): no baseline, removing fileState`);
         this.stateManager.removeFile(filePath);
         this.onStateChanged();
       }
@@ -412,7 +454,7 @@ export class FileWatcher {
         childrenCleaned++;
       }
       if (childrenCleaned > 0) {
-        log(`onDiskDelete(${basename}): cleaned ${childrenCleaned} child file(s) from deleted directory`);
+        log(() => `onDiskDelete(${basename}): cleaned ${childrenCleaned} child file(s) from deleted directory`);
         this.onStateChanged();
       }
       return;
@@ -496,6 +538,19 @@ export class FileWatcher {
   }
 
   private enterReviewing(filePath: string, baseline: string | null, current: string): void {
+    // codex-only gate: only review files attributed to Codex. An unconfirmed
+    // change waits CODEX_GRACE_MS for the Codex signal; if it never arrives the
+    // change is silently absorbed into the baseline (see resolveCodexGate).
+    if (this.stateManager.codexOnly
+      && !this.stateManager.getFile(filePath)
+      && !this.codexSignal?.isCodexEdited(filePath)) {
+      this.scheduleCodexGate(filePath);
+      return;
+    }
+    this.enterReviewingDirect(filePath, baseline, current);
+  }
+
+  private enterReviewingDirect(filePath: string, baseline: string | null, current: string): void {
     if (!canComputeHunks(baseline, current)) {
       this.markReviewingUnavailable(filePath, baseline, { ok: false, reason: 'tooLarge' });
       return;
@@ -507,9 +562,108 @@ export class FileWatcher {
     // Allow 0-hunk entry for new files (null baseline) and deleted files (file gone, nothing to diff)
     if (hunks.length === 0 && !isNew && !isDeleted) return;
     const tag = isNew ? ' (new)' : isDeleted ? ' (deleted)' : '';
-    log(`reviewing: ${path.basename(filePath)}${tag}`);
+    log(() => `reviewing: ${path.basename(filePath)}${tag}`);
     this.stateManager.setFile(filePath, { status: 'reviewing', baseline });
     this.onStateChanged();
+  }
+
+  // ── codex-only mode ─────────────────────────────────────────────────────────
+
+  private scheduleCodexGate(filePath: string): void {
+    const existing = this.pendingCodexGate.get(filePath);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.pendingCodexGate.delete(filePath);
+      void this.resolveCodexGate(filePath).catch(err => log(`resolveCodexGate error: ${err}`));
+    }, CODEX_GRACE_MS);
+    this.pendingCodexGate.set(filePath, timer);
+  }
+
+  private async resolveCodexGate(filePath: string): Promise<void> {
+    if (this._suppressed || !this.stateManager.enabled || !this.stateManager.codexOnly) return;
+    if (this.codexSignal?.isCodexEdited(filePath)) {
+      await this.reviewCodexFile(filePath);
+    } else {
+      await this.silentlyAccept(filePath);
+    }
+  }
+
+  /** Enter (or refresh) review for a file confirmed to be edited by Codex. */
+  private async reviewCodexFile(filePath: string): Promise<void> {
+    filePath = normalizePath(filePath);
+    if (this._suppressed || !this.stateManager.enabled) return;
+    if (this.shouldIgnore(filePath)) return;
+
+    const existing = this.stateManager.getFile(filePath);
+    if (existing?.status === 'reviewing') {
+      const diskRead = await readTextFile(filePath);
+      if (diskRead.ok) {
+        this.recomputeHunks(filePath, existing.baseline, diskRead.content);
+      } else {
+        this.markReviewingUnavailable(filePath, existing.baseline, diskRead);
+      }
+      return;
+    }
+
+    const git = this.stateManager.git;
+    if (!git) return;
+
+    const diskRead = await readTextFile(filePath);
+    if (!diskRead.ok) {
+      const gitBaseline = await git.getBaseline(filePath);
+      if (diskRead.errorCode === 'ENOENT') {
+        // Codex deleted the file — show a deletion diff if there's a text baseline
+        if (gitBaseline === undefined) return;
+        if (textLooksBinary(gitBaseline)) {
+          this.markReviewingUnavailable(filePath, '', { ok: false, reason: 'unreadable' });
+        } else {
+          this.enterReviewingDirect(filePath, gitBaseline, '');
+        }
+        return;
+      }
+      if (gitBaseline !== undefined) {
+        this.markReviewingUnavailable(filePath, gitBaseline, diskRead);
+      }
+      return;
+    }
+
+    const pendingBaseline = this.stateManager.getPendingBaselineSnapshot(filePath);
+    const gitBaseline = pendingBaseline !== undefined ? pendingBaseline : await git.getBaseline(filePath);
+    this.enterReviewingDirect(filePath, gitBaseline ?? null, diskRead.content);
+  }
+
+  /** Absorb a non-Codex change into the baseline without reviewing it. */
+  private async silentlyAccept(filePath: string): Promise<void> {
+    filePath = normalizePath(filePath);
+    if (!this.stateManager.enabled) return;
+    if (this.shouldIgnore(filePath)) return;
+
+    const diskRead = await readTextFile(filePath);
+    if (diskRead.ok) {
+      this.stateManager.snapshotFile(filePath, diskRead.content);
+      return;
+    }
+    if (diskRead.errorCode === 'ENOENT') {
+      // Non-Codex deletion — accept by dropping the baseline.
+      this.stateManager.removeFile(filePath);
+      return;
+    }
+    // Binary / oversized — absorb current bytes as the baseline.
+    this.stateManager.snapshotFileBytes(filePath);
+  }
+
+  /** Called when the Codex signal file reports newly-edited paths. */
+  onCodexSignal(paths: string[]): void {
+    if (this._suppressed || !this.stateManager.enabled || !this.stateManager.codexOnly) return;
+    for (const p of paths) {
+      const norm = normalizePath(p);
+      const timer = this.pendingCodexGate.get(norm);
+      if (timer) {
+        clearTimeout(timer);
+        this.pendingCodexGate.delete(norm);
+      }
+      void this.reviewCodexFile(norm).catch(err => log(`reviewCodexFile error: ${err}`));
+    }
   }
 
   private recomputeHunks(filePath: string, baseline: string | null, current: string): void {
@@ -535,7 +689,7 @@ export class FileWatcher {
   }
 
   private markReviewingUnavailable(filePath: string, baseline: string | null, read: Extract<TextFileReadResult, { ok: false }>): void {
-    log(`reviewing: ${path.basename(filePath)} (${read.reason}, file-level)`);
+    log(() => `reviewing: ${path.basename(filePath)} (${read.reason}, file-level)`);
     this.stateManager.setFile(filePath, {
       status: 'reviewing',
       baseline,
@@ -555,6 +709,10 @@ export class FileWatcher {
       clearTimeout(timer);
     }
     this.diskChangeTimers.clear();
+    for (const timer of this.pendingCodexGate.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingCodexGate.clear();
     this.pendingUserDeletes.clear();
     this.pendingRenameOldPaths.clear();
     this.disposables.forEach(d => d.dispose());

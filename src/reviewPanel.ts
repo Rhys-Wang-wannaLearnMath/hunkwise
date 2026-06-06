@@ -25,6 +25,10 @@ interface PanelState {
   quoteRotationInterval: number;
   useDiffEditor: boolean;
   showInlineDecorations: boolean;
+  codexOnly: boolean;
+  codexHookInstalled: boolean;
+  trackCodeDocsOnly: boolean;
+  trackedExtensions: string[];
   totalFiles: number;
   totalHunks: number;
   totalAdded: number;
@@ -56,8 +60,13 @@ interface PanelHunk {
 export class ReviewPanel implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private _loading: boolean = false;
+  private _codexHookInstalled: boolean = false;
 
   get loading(): boolean { return this._loading; }
+
+  setCodexHookInstalled(installed: boolean): void {
+    this._codexHookInstalled = installed;
+  }
 
   constructor(
     private context: vscode.ExtensionContext,
@@ -197,6 +206,10 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
       quoteRotationInterval: this.stateManager.quoteRotationInterval,
       useDiffEditor: this.stateManager.useDiffEditor,
       showInlineDecorations: this.stateManager.showInlineDecorations,
+      codexOnly: this.stateManager.codexOnly,
+      codexHookInstalled: this._codexHookInstalled,
+      trackCodeDocsOnly: this.stateManager.trackCodeDocsOnly,
+      trackedExtensions: this.stateManager.trackedExtensions,
       totalFiles: files.length,
       totalHunks,
       totalAdded,
@@ -210,6 +223,7 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
     filePath?: string;
     hunkId?: string;
     folders?: string[];
+    extensions?: string[];
     value?: boolean;
   }): Promise<void> {
     switch (msg.command) {
@@ -297,6 +311,25 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
         if (msg.value !== undefined) {
           this.stateManager.setShowInlineDecorations(msg.value as boolean);
           this.onStateChanged();
+        }
+        break;
+      case 'setCodexOnly':
+        if (msg.value !== undefined) {
+          this.stateManager.setCodexOnly(msg.value as boolean);
+          this.onStateChanged();
+        }
+        break;
+      case 'installCodexHook':
+        await vscode.commands.executeCommand('hunkwise.installCodexHook');
+        break;
+      case 'setTrackCodeDocsOnly':
+        if (msg.value !== undefined) {
+          await vscode.commands.executeCommand('hunkwise.setTrackCodeDocsOnly', msg.value);
+        }
+        break;
+      case 'setTrackedExtensions':
+        if (msg.extensions !== undefined) {
+          await vscode.commands.executeCommand('hunkwise.setTrackedExtensions', msg.extensions);
         }
         break;
       case 'openFile':

@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileState } from './types';
-import { HunkwiseGit, Settings } from './hunkwiseGit';
+import { HunkwiseGit, Settings, DEFAULT_TRACKED_EXTENSIONS } from './hunkwiseGit';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
 import { readTextFile, textLooksBinary } from './fileContent';
@@ -44,6 +44,9 @@ export class StateManager {
   private _quoteRotationInterval: number = 30;
   private _useDiffEditor: boolean = true;
   private _showInlineDecorations: boolean = true;
+  private _codexOnly: boolean = false;
+  private _trackCodeDocsOnly: boolean = false;
+  private _trackedExtensions: string[] = [...DEFAULT_TRACKED_EXTENSIONS];
   private _git: HunkwiseGit | undefined;
 
   // Serial queue: git ops run one at a time; flush() awaits the tail
@@ -56,6 +59,9 @@ export class StateManager {
   // Set by the extension to trigger UI refresh after unexpected state restoration.
   onRollback: (() => void) | undefined;
   onReviewUndoChanged: (() => void) | undefined;
+  // Invoked when a file leaves reviewing (accept/discard/resolved-to-0-hunks).
+  // Used by codex-only mode to forget a Codex attribution once handled.
+  onFileResolved: ((filePath: string) => void) | undefined;
 
   private reviewUndoStack: ReviewUndoEntry[] = [];
 
@@ -77,6 +83,9 @@ export class StateManager {
   get quoteRotationInterval(): number { return this._quoteRotationInterval; }
   get useDiffEditor(): boolean { return this._useDiffEditor; }
   get showInlineDecorations(): boolean { return this._showInlineDecorations; }
+  get codexOnly(): boolean { return this._codexOnly; }
+  get trackCodeDocsOnly(): boolean { return this._trackCodeDocsOnly; }
+  get trackedExtensions(): string[] { return this._trackedExtensions; }
   get dir(): string | undefined { return this.hunkwiseDir; }
   get git(): HunkwiseGit | undefined { return this._git; }
 
@@ -206,6 +215,9 @@ export class StateManager {
     this._quoteRotationInterval = settings.quoteRotationInterval;
     this._useDiffEditor = settings.useDiffEditor;
     this._showInlineDecorations = settings.showInlineDecorations;
+    this._codexOnly = settings.codexOnly ?? false;
+    this._trackCodeDocsOnly = settings.trackCodeDocsOnly ?? false;
+    this._trackedExtensions = settings.trackedExtensions ?? [...DEFAULT_TRACKED_EXTENSIONS];
 
     // Initialize git (idempotent) then restore in-memory state from HEAD
     await g.initGit();
@@ -442,6 +454,7 @@ export class StateManager {
     // Clone old state so the rollback has an independent snapshot
     const oldState = this.state.has(filePath) ? { ...this.state.get(filePath)! } : undefined;
     this.state.delete(filePath);
+    this.onFileResolved?.(filePath);
     // Skip git removal only when we know the file had a null baseline (never stored in git).
     // If oldState is undefined (idle file, not in map) or has a real baseline, queue the removal.
     if (this._git && !(oldState !== undefined && oldState.baseline === null)) {
@@ -517,6 +530,25 @@ export class StateManager {
     }
   }
 
+  /**
+   * Snapshot a file's current bytes from disk as its baseline via the git queue,
+   * without entering/exiting reviewing. Used to silently absorb non-Codex changes
+   * to binary/oversized files in codex-only mode.
+   */
+  snapshotFileBytes(filePath: string): void {
+    filePath = normalizePath(filePath);
+    if (this._git) {
+      const g = this._git;
+      this.pendingFileSnapshots.add(filePath);
+      this.gitQueue = this.gitQueue.then(() => g.snapshotFile(filePath)).then(() => {
+        this.pendingFileSnapshots.delete(filePath);
+      }).catch(err => {
+        this.pendingFileSnapshots.delete(filePath);
+        log(`git queue error (snapshotFileBytes): ${err}`);
+      });
+    }
+  }
+
   getPendingBaselineSnapshot(filePath: string): string | undefined {
     return this.pendingBaselineSnapshots.get(normalizePath(filePath));
   }
@@ -543,6 +575,7 @@ export class StateManager {
     filePath = normalizePath(filePath);
     const oldState = this.state.has(filePath) ? { ...this.state.get(filePath)! } : undefined;
     this.state.delete(filePath);
+    this.onFileResolved?.(filePath);
     if (newBaseline !== undefined && newBaseline !== null) {
       if (this._git) {
         const g = this._git;
@@ -578,6 +611,7 @@ export class StateManager {
     filePath = normalizePath(filePath);
     const oldState = this.state.has(filePath) ? { ...this.state.get(filePath)! } : undefined;
     this.state.delete(filePath);
+    this.onFileResolved?.(filePath);
     if (this._git) {
       const g = this._git;
       this.pendingFileSnapshots.add(filePath);
@@ -615,6 +649,9 @@ export class StateManager {
       this._quoteRotationInterval = merged.quoteRotationInterval;
       this._useDiffEditor = merged.useDiffEditor;
       this._showInlineDecorations = merged.showInlineDecorations;
+      this._codexOnly = merged.codexOnly ?? false;
+      this._trackCodeDocsOnly = merged.trackCodeDocsOnly ?? false;
+      this._trackedExtensions = merged.trackedExtensions ?? [...DEFAULT_TRACKED_EXTENSIONS];
     } else {
       this.state.clear();
       this.pendingBaselineSnapshots.clear();
@@ -661,7 +698,7 @@ export class StateManager {
   }
 
   private currentSettings() {
-    return { settingsVersion: 2, ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, autoEnable: this._autoEnable, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations };
+    return { settingsVersion: 2, ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, autoEnable: this._autoEnable, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations, codexOnly: this._codexOnly, trackCodeDocsOnly: this._trackCodeDocsOnly, trackedExtensions: this._trackedExtensions };
   }
 
   setIgnorePatterns(patterns: string[]): void {
@@ -716,6 +753,36 @@ export class StateManager {
     }
   }
 
+  setCodexOnly(value: boolean): void {
+    log(`settings: codexOnly=${value}`);
+    this._codexOnly = value;
+    if (this._enabled && this._git) {
+      this._git.saveSettings({ ...this.currentSettings(), codexOnly: value });
+    }
+  }
+
+  setTrackCodeDocsOnly(value: boolean): void {
+    log(`settings: trackCodeDocsOnly=${value}`);
+    this._trackCodeDocsOnly = value;
+    if (this._enabled && this._git) {
+      this._git.saveSettings({ ...this.currentSettings(), trackCodeDocsOnly: value });
+    }
+  }
+
+  setTrackedExtensions(extensions: string[]): void {
+    const seen = new Set<string>();
+    const cleaned: string[] = [];
+    for (const raw of extensions) {
+      const e = String(raw).trim().replace(/^\./, '');
+      if (e && !seen.has(e)) { seen.add(e); cleaned.push(e); }
+    }
+    this._trackedExtensions = cleaned;
+    log(`settings: trackedExtensions=${cleaned.length} entries`);
+    if (this._enabled && this._git) {
+      this._git.saveSettings({ ...this.currentSettings(), trackedExtensions: cleaned });
+    }
+  }
+
   /**
    * Reload all settings from settings.json (called when settings.json is modified externally).
    * Returns the new ignorePatterns if enabled, null if not enabled or no git.
@@ -730,6 +797,9 @@ export class StateManager {
     this._quoteRotationInterval = settings.quoteRotationInterval;
     this._useDiffEditor = settings.useDiffEditor;
     this._showInlineDecorations = settings.showInlineDecorations;
+    this._codexOnly = settings.codexOnly ?? false;
+    this._trackCodeDocsOnly = settings.trackCodeDocsOnly ?? false;
+    this._trackedExtensions = settings.trackedExtensions ?? [...DEFAULT_TRACKED_EXTENSIONS];
     return this._ignorePatterns;
   }
 
@@ -886,6 +956,9 @@ export class StateManager {
     this._useDiffEditor = true;
     this._showInlineDecorations = true;
     this._autoEnable = false;
+    this._codexOnly = false;
+    this._trackCodeDocsOnly = false;
+    this._trackedExtensions = [...DEFAULT_TRACKED_EXTENSIONS];
     this.state.clear();
     this.pendingBaselineSnapshots.clear();
     this.pendingFileSnapshots.clear();

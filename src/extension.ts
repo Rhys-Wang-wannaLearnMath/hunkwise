@@ -10,6 +10,8 @@ import { DiffCodeLensProvider } from './diffCodeLens';
 import { canComputeHunks, computeHunks, hunkId } from './diffEngine';
 import { initLog, log } from './log';
 import { upsertGitignore } from './gitignoreManager';
+import { CodexSignal } from './codexSignal';
+import { installCodexHook, isCodexHookInstalled } from './codexHookInstaller';
 
 export async function activate(context: vscode.ExtensionContext): Promise<{ getReviewPanel: () => ReviewPanel | undefined; getStateManager: () => StateManager | undefined; getFileWatcher: () => FileWatcher | undefined }> {
   initLog();
@@ -36,13 +38,48 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
   let decorationManager: DecorationManager | undefined;
   let reviewPanel: ReviewPanel | undefined;
   let diffCodeLensProvider: DiffCodeLensProvider | undefined;
+  let codexSignal: CodexSignal | undefined;
 
-  // Original state-changed callback — no diff-editor side effects
-  function onStateChanged(): void {
+  // State-changed callback — no diff-editor side effects. Bursts of file events
+  // (batch writes, git checkout, AI edits) can call this many times in quick
+  // succession; coalesce the UI refresh with a leading+trailing debounce so the
+  // first change shows immediately and the rest collapse into one trailing
+  // refresh instead of repeatedly rebuilding the panel/decorations/CodeLens.
+  const REFRESH_DEBOUNCE_MS = 50;
+  let refreshTimer: NodeJS.Timeout | undefined;
+  let refreshPending = false;
+
+  function performStateChange(): void {
     decorationManager?.refresh();
     reviewPanel?.refresh();
     diffCodeLensProvider?.fire();
     updateUndoContext();
+    syncCodexSignal();
+  }
+
+  function onStateChanged(): void {
+    if (refreshTimer) {
+      refreshPending = true; // inside the window → defer to the trailing edge
+      return;
+    }
+    performStateChange(); // leading edge: reflect the first change immediately
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
+      if (refreshPending) {
+        refreshPending = false;
+        performStateChange();
+      }
+    }, REFRESH_DEBOUNCE_MS);
+  }
+  context.subscriptions.push({
+    dispose: () => { if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; } },
+  });
+
+  // Watch the Codex signal file only while hunkwise is enabled.
+  function syncCodexSignal(): void {
+    if (!codexSignal) return;
+    if (stateManager.enabled) codexSignal.start();
+    else codexSignal.stop();
   }
 
   /** Notify the diff editor that a specific file's baseline changed (only after accept). */
@@ -182,6 +219,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
   fileWatcher.register(context);
   fileWatcher.suppressAll();
 
+  // ── codex-only signal wiring ────────────────────────────────────────────────
+  // The installed Codex hook appends edited paths to codex-edits.jsonl in the
+  // hunkwise dir. CodexSignal watches it and, in codex-only mode, drives the
+  // FileWatcher to review Codex edits (everything else is silently absorbed).
+  const codexWorkspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const codexHunkwiseDir = stateManager.dir;
+  if (codexHunkwiseDir) {
+    codexSignal = new CodexSignal(codexHunkwiseDir, codexWorkspaceRoot, paths => {
+      fileWatcher.onCodexSignal(paths);
+      onStateChanged();
+    });
+    fileWatcher.setCodexSignal(codexSignal);
+    stateManager.onFileResolved = fp => codexSignal?.markConsumed(fp);
+    context.subscriptions.push({ dispose: () => codexSignal?.stop() });
+  }
+
   try {
     await stateManager.load((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
     log(`loaded state: enabled=${stateManager.enabled}, files=${stateManager.getAllFiles().size}`);
@@ -250,6 +303,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     vscode.window.registerWebviewViewProvider('hunkwiseToolbar', reviewPanel)
   );
 
+  if (codexWorkspaceRoot) {
+    reviewPanel.setCodexHookInstalled(isCodexHookInstalled(codexWorkspaceRoot));
+  }
+
   registerCommands(context, stateManager, fileWatcher, reviewPanel, onStateChanged);
 
   // ── Diff CodeLens ─────────────────────────────────────────────────────────
@@ -286,6 +343,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
   context.subscriptions.push(
     vscode.commands.registerCommand('hunkwise.openSettings', () => {
       reviewPanel?.openSettings();
+    }),
+    vscode.commands.registerCommand('hunkwise.installCodexHook', async () => {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const dir = stateManager.dir;
+      if (!root || !dir) {
+        void vscode.window.showWarningMessage('hunkwise: open a workspace folder before installing the Codex hook.');
+        return;
+      }
+      try {
+        const result = installCodexHook(context.extensionUri.fsPath, root, dir);
+        reviewPanel?.setCodexHookInstalled(true);
+        reviewPanel?.refresh();
+        const verb = result.status === 'alreadyPresent' ? 'already installed'
+          : result.status === 'updated' ? 'updated' : 'installed';
+        void vscode.window.showInformationMessage(
+          `hunkwise: Codex hook ${verb}. Run /hooks in Codex to trust it, then turn on "Only track Codex edits".`
+        );
+      } catch (err) {
+        log(`installCodexHook failed: ${err}`);
+        void vscode.window.showErrorMessage(`hunkwise: failed to install Codex hook — ${err}`);
+      }
     }),
     vscode.commands.registerCommand('hunkwise.refresh', async () => {
       if (!stateManager.enabled) return;

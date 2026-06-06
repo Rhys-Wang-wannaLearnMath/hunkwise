@@ -15,7 +15,8 @@
     "src/fileContent.ts",
     "src/hunkwiseGit.ts",
     "src/gitignoreManager.ts",
-    "src/pathNormalize.ts"
+    "src/pathNormalize.ts",
+    "src/codexPatchParse.ts"
   ],
   "exclude": [
     "node_modules",
