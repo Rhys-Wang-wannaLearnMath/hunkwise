@@ -232,6 +232,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
     });
     fileWatcher.setCodexSignal(codexSignal);
     stateManager.onFileResolved = fp => codexSignal?.markConsumed(fp);
+    stateManager.onCodexOnlyChanged = value => {
+      if (!value) fileWatcher.clearPendingCodexGates();
+    };
     context.subscriptions.push({ dispose: () => codexSignal?.stop() });
   }
 

@@ -144,7 +144,7 @@ suite('hunkwise codex-only integration', function () {
 
     const sm = getStateManager();
     assert.ok(sm, 'StateManager should be available');
-    // codexOnly stays false (default)
+    // Integration tests run with HUNKWISE_DEFAULT_CODEX_ONLY=0; explicitly off here
 
     writeFileExternally(filePath, 'original\nplain change\n');
     const fw = getFileWatcher();

@@ -45,6 +45,9 @@ export const DEFAULT_TRACKED_EXTENSIONS: string[] = [
   'Dockerfile', 'Makefile', 'Rakefile', 'Gemfile', 'Procfile',
 ];
 
+/** Default for codex-only mode. Set HUNKWISE_DEFAULT_CODEX_ONLY=0 in test env to disable. */
+export const DEFAULT_CODEX_ONLY = process.env.HUNKWISE_DEFAULT_CODEX_ONLY !== '0';
+
 const DEFAULT_SETTINGS: Settings = {
   settingsVersion: 2,
   ignorePatterns: process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'],
@@ -54,7 +57,7 @@ const DEFAULT_SETTINGS: Settings = {
   quoteRotationInterval: 30,
   useDiffEditor: true,
   showInlineDecorations: true,
-  codexOnly: false,
+  codexOnly: DEFAULT_CODEX_ONLY,
   trackCodeDocsOnly: false,
   trackedExtensions: [...DEFAULT_TRACKED_EXTENSIONS],
 };

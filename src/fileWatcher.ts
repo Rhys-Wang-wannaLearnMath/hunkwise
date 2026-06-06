@@ -579,6 +579,14 @@ export class FileWatcher {
     this.pendingCodexGate.set(filePath, timer);
   }
 
+  /** Drop pending codex-only grace timers (e.g. when codexOnly is turned off). */
+  clearPendingCodexGates(): void {
+    for (const timer of this.pendingCodexGate.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingCodexGate.clear();
+  }
+
   private async resolveCodexGate(filePath: string): Promise<void> {
     if (this._suppressed || !this.stateManager.enabled || !this.stateManager.codexOnly) return;
     if (this.codexSignal?.isCodexEdited(filePath)) {

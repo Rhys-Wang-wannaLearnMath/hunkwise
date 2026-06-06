@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileState } from './types';
-import { HunkwiseGit, Settings, DEFAULT_TRACKED_EXTENSIONS } from './hunkwiseGit';
+import { HunkwiseGit, Settings, DEFAULT_TRACKED_EXTENSIONS, DEFAULT_CODEX_ONLY } from './hunkwiseGit';
 import { log } from './log';
 import { normalizePath } from './pathNormalize';
 import { readTextFile, textLooksBinary } from './fileContent';
@@ -44,7 +44,7 @@ export class StateManager {
   private _quoteRotationInterval: number = 30;
   private _useDiffEditor: boolean = true;
   private _showInlineDecorations: boolean = true;
-  private _codexOnly: boolean = false;
+  private _codexOnly: boolean = DEFAULT_CODEX_ONLY;
   private _trackCodeDocsOnly: boolean = false;
   private _trackedExtensions: string[] = [...DEFAULT_TRACKED_EXTENSIONS];
   private _git: HunkwiseGit | undefined;
@@ -62,6 +62,8 @@ export class StateManager {
   // Invoked when a file leaves reviewing (accept/discard/resolved-to-0-hunks).
   // Used by codex-only mode to forget a Codex attribution once handled.
   onFileResolved: ((filePath: string) => void) | undefined;
+  /** Called when codexOnly changes so FileWatcher can drop pending grace timers. */
+  onCodexOnlyChanged: ((value: boolean) => void) | undefined;
 
   private reviewUndoStack: ReviewUndoEntry[] = [];
 
@@ -215,7 +217,7 @@ export class StateManager {
     this._quoteRotationInterval = settings.quoteRotationInterval;
     this._useDiffEditor = settings.useDiffEditor;
     this._showInlineDecorations = settings.showInlineDecorations;
-    this._codexOnly = settings.codexOnly ?? false;
+    this._codexOnly = settings.codexOnly ?? DEFAULT_CODEX_ONLY;
     this._trackCodeDocsOnly = settings.trackCodeDocsOnly ?? false;
     this._trackedExtensions = settings.trackedExtensions ?? [...DEFAULT_TRACKED_EXTENSIONS];
 
@@ -649,7 +651,7 @@ export class StateManager {
       this._quoteRotationInterval = merged.quoteRotationInterval;
       this._useDiffEditor = merged.useDiffEditor;
       this._showInlineDecorations = merged.showInlineDecorations;
-      this._codexOnly = merged.codexOnly ?? false;
+      this._codexOnly = merged.codexOnly ?? DEFAULT_CODEX_ONLY;
       this._trackCodeDocsOnly = merged.trackCodeDocsOnly ?? false;
       this._trackedExtensions = merged.trackedExtensions ?? [...DEFAULT_TRACKED_EXTENSIONS];
     } else {
@@ -759,6 +761,7 @@ export class StateManager {
     if (this._enabled && this._git) {
       this._git.saveSettings({ ...this.currentSettings(), codexOnly: value });
     }
+    this.onCodexOnlyChanged?.(value);
   }
 
   setTrackCodeDocsOnly(value: boolean): void {
@@ -797,7 +800,7 @@ export class StateManager {
     this._quoteRotationInterval = settings.quoteRotationInterval;
     this._useDiffEditor = settings.useDiffEditor;
     this._showInlineDecorations = settings.showInlineDecorations;
-    this._codexOnly = settings.codexOnly ?? false;
+    this._codexOnly = settings.codexOnly ?? DEFAULT_CODEX_ONLY;
     this._trackCodeDocsOnly = settings.trackCodeDocsOnly ?? false;
     this._trackedExtensions = settings.trackedExtensions ?? [...DEFAULT_TRACKED_EXTENSIONS];
     return this._ignorePatterns;
@@ -956,7 +959,7 @@ export class StateManager {
     this._useDiffEditor = true;
     this._showInlineDecorations = true;
     this._autoEnable = false;
-    this._codexOnly = false;
+    this._codexOnly = DEFAULT_CODEX_ONLY;
     this._trackCodeDocsOnly = false;
     this._trackedExtensions = [...DEFAULT_TRACKED_EXTENSIONS];
     this.state.clear();
